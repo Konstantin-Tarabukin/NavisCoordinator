@@ -13,11 +13,7 @@ namespace NavisCoordinator
     {
         public override int Execute(params string[] parameters)
         {
-            Document doc = Autodesk.Navisworks.Api.Application.ActiveDocument;
-
-            string text = ModelInspector.GetSelectedItemInfo(doc);
-
-            MessageBox.Show(text);
+            SearchSetService.CreateTestSearchSet();
 
             return 0;
         }
