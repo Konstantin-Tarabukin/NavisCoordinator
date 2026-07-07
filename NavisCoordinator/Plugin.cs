@@ -1,4 +1,6 @@
-﻿using Autodesk.Navisworks.Api.Plugins;
+﻿using Autodesk.Navisworks.Api;
+using Autodesk.Navisworks.Api.Plugins;
+using NavisCoordinator.Services;
 using System.Windows.Forms;
 
 namespace NavisCoordinator
@@ -11,9 +13,11 @@ namespace NavisCoordinator
     {
         public override int Execute(params string[] parameters)
         {
-            MessageBox.Show(
-                "Плагин успешно загружен!",
-                "Navis Coordinator");
+            Document doc = Autodesk.Navisworks.Api.Application.ActiveDocument;
+
+            string text = ModelInspector.GetSelectedItemInfo(doc);
+
+            MessageBox.Show(text);
 
             return 0;
         }
