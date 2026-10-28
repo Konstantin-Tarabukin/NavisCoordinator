@@ -53,36 +53,75 @@
     <Reference Include="System.Data" />
     <Reference Include="System.Net.Http" />
     <Reference Include="System.Xml" />
+    <Reference Include="System.Web.Extensions" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Plugin.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Services\ModelInspector.cs" />
     <Compile Include="Services\SearchSetService.cs" />
+    <Compile Include="Services\SelectionSetExporter.cs" />
+    <Compile Include="Services\SelectionSetMatcher.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
     <PostBuildEvent>@echo off
-
 echo ===== BUILD COPY =====
 
 echo APPDATA=%25APPDATA%25
 
-if not exist "%25APPDATA%25\Autodesk\Navisworks Manage 2023\Plugins\NavisCoordinator" (
-    mkdir "%25APPDATA%25\Autodesk\Navisworks Manage 2023\Plugins\NavisCoordinator"
+set "DEST=%25APPDATA%25\Autodesk\Navisworks Manage 2023\Plugins\NavisCoordinator"
+
+if not exist "%25DEST%25" (
+    mkdir "%25DEST%25"
+)
+
+if not exist "%25DEST%25" (
+    echo ERROR: Cannot create plugin directory.
+    exit /b 1
 )
 
 echo.
-echo SOURCE:
+echo SOURCE DLL:
 echo $(TargetPath)
 
 echo.
+echo SOURCE PDB:
+echo $(TargetDir)$(TargetName).pdb
+
+echo.
 echo DEST:
-echo %25APPDATA%25\Autodesk\Navisworks Manage 2023\Plugins\NavisCoordinator\
+echo %25DEST%25\
 
-copy /Y "$(TargetPath)" "%25APPDATA%25\Autodesk\Navisworks Manage 2023\Plugins\NavisCoordinator\"
+echo.
+echo ===== COPY DLL =====
 
-echo ERRORLEVEL=%25ERRORLEVEL%25
+copy /Y "$(TargetPath)" "%25DEST%25\"
+
+if errorlevel 1 (
+    echo ERROR: DLL copy failed.
+    exit /b 1
+)
+
+echo.
+echo ===== COPY PDB =====
+
+if not exist "$(TargetDir)$(TargetName).pdb" (
+    echo ERROR: PDB file not found.
+    echo Expected: $(TargetDir)$(TargetName).pdb
+    exit /b 1
+)
+
+copy /Y "$(TargetDir)$(TargetName).pdb" "%25DEST%25\"
+
+if errorlevel 1 (
+    echo ERROR: PDB copy failed.
+    exit /b 1
+)
+
+echo.
+echo ===== BUILD COPY COMPLETED =====
+echo DLL and PDB copied successfully.
 
 exit /b 0</PostBuildEvent>
   </PropertyGroup>

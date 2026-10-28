@@ -1,0 +1,2897 @@
+﻿using Autodesk.Navisworks.Api;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+
+namespace NavisCoordinator.Services
+{
+    /// <summary>
+    /// Matches source Selection Sets exported to JSON against the current Navisworks model.
+    /// Dry Run is read-only; the separate transfer mode creates sets only after validation
+    /// and explicit confirmation. It never saves the NWF automatically.
+    /// The matcher supports category fan-out, identity-verified repeated type nodes,
+    /// and conservative structural fan-out for identity-less containers repeated
+    /// across Revit levels. Root remapping is configured in rootOverrides.json.
+    /// </summary>
+    public static class SelectionSetMatcher
+    {
+        private const int MaxRootSearchDepth = 4;
+        private const int MaxIntermediateSearchDepth = 12;
+        private const int MaxNodesInspected = 250000;
+        private const int MaxPathCandidates = 1000;
+        private const int MaxPathSearchVisits = 1000000;
+        private const int MaxCandidatePathsInReport = 10;
+
+        public static void RunDryRun()
+        {
+            RunMatchingWorkflow(false);
+        }
+
+        // Creates Selection Sets only after a complete successful preflight and
+        // an explicit user confirmation. It never overwrites existing sets and
+        // never saves the NWF automatically.
+        public static void RunTransfer()
+        {
+            RunMatchingWorkflow(true);
+        }
+
+        private static void RunMatchingWorkflow(bool applyTransfer)
+        {
+            try
+            {
+                Document document = Autodesk.Navisworks.Api.Application.ActiveDocument;
+                if (document == null || document.IsClear)
+                {
+                    MessageBox.Show(
+                        "Сначала откройте целевой NWF с загруженной моделью.",
+                        "Navis Coordinator — проверка соответствий",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                if (!applyTransfer)
+                {
+                    // Temporary diagnostic mode. This uses the existing plugin command,
+                    // so no menu/XAML wiring is required. Choose Yes to export the loaded
+                    // Navisworks model trees to CSV; choose No for the normal matching Dry Run.
+                    DialogResult diagnosticChoice = MessageBox.Show(
+                        "Нужен диагностический дамп дерева Navisworks?\n\n" +
+                        "Да — сохранить структуру загруженных моделей в CSV и завершить.\n" +
+                        "Нет — продолжить обычную проверку Selection Sets.\n" +
+                        "Отмена — выйти.",
+                        "Navis Coordinator — режим диагностики",
+                        MessageBoxButtons.YesNoCancel,
+                        MessageBoxIcon.Question);
+
+                    if (diagnosticChoice == DialogResult.Yes)
+                    {
+                        RunTreeDump(document);
+                        return;
+                    }
+
+                    if (diagnosticChoice == DialogResult.Cancel)
+                        return;
+
+                }
+
+                string sourceJsonPath;
+                string sourceJson = ReadSourceJson(out sourceJsonPath);
+                if (string.IsNullOrEmpty(sourceJson))
+                    return;
+
+                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                serializer.MaxJsonLength = int.MaxValue;
+                serializer.RecursionLimit = 100;
+
+                object parsed = serializer.DeserializeObject(sourceJson);
+                Dictionary<string, object> sourceDocument = AsDictionary(parsed);
+                if (sourceDocument == null)
+                {
+                    MessageBox.Show(
+                        "Выбранный JSON не содержит ожидаемый объект верхнего уровня.",
+                        "Navis Coordinator",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                List<ExpectedSet> expectedSets = ReadExpectedSets(sourceDocument);
+                int expectedItemCount = CountExpectedItems(expectedSets);
+                if (expectedSets.Count == 0 || expectedItemCount == 0)
+                {
+                    MessageBox.Show(
+                        "В JSON не найдены Selection Sets или выбранные узлы.\n" +
+                        "Проверьте, что это файл экспорта формата 2.",
+                        "Navis Coordinator",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                string rootOverridesPath = Path.Combine(
+                    Path.GetDirectoryName(sourceJsonPath) ?? "",
+                    "rootOverrides.json");
+                bool rootOverridesConfigExists = File.Exists(rootOverridesPath);
+                Dictionary<string, string> rootOverrides;
+                try
+                {
+                    rootOverrides = LoadRootOverrides(rootOverridesPath, serializer);
+                }
+                catch (Exception configException)
+                {
+                    MessageBox.Show(
+                        "Не удалось прочитать файл сопоставления моделей:\n\n" +
+                        rootOverridesPath + "\n\n" + configException.Message +
+                        "\n\nИсправьте rootOverrides.json или временно уберите его из папки исходного JSON.",
+                        "Navis Coordinator — ошибка root mapping",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return;
+                }
+
+                List<object> setReports = new List<object>();
+                Dictionary<ExpectedSet, Dictionary<string, ModelItem>> resolvedTargetItemsBySet =
+                    new Dictionary<ExpectedSet, Dictionary<string, ModelItem>>();
+                int uniqueMatches = 0;
+                int oneToManyCategoryMatches = 0;
+                int oneToManyIdentityMatches = 0;
+                int oneToManyStructuralMatches = 0;
+                int identityDisambiguatedMatches = 0;
+                int missingItems = 0;
+                int ambiguousItems = 0;
+                int searchLimitItems = 0;
+                int identityWarningCount = 0;
+                int nodesInspected = 0;
+                int targetNodesIndexed = 0;
+                int targetPathSearchVisits = 0;
+                bool searchLimitReached = false;
+
+                // Locate each linked-model root once, then index only required branches.
+                // The dictionary key stays the SOURCE root name so source paths remain
+                // unchanged. Optional rootOverrides.json can map a source RVT filename
+                // to another target RVT filename; Navisworks position suffixes are ignored.
+                List<string> requiredRootNames = GetRequiredRootNames(expectedSets);
+                Dictionary<string, List<TargetNodeInfo>> indexedRootsByName =
+                    new Dictionary<string, List<TargetNodeInfo>>(StringComparer.Ordinal);
+                HashSet<string> processedRootNames =
+                    new HashSet<string>(StringComparer.Ordinal);
+                Dictionary<TargetNodeInfo, Dictionary<string, List<TargetNodeInfo>>> descendantMatchCache =
+                    new Dictionary<TargetNodeInfo, Dictionary<string, List<TargetNodeInfo>>>();
+                List<object> rootMappingReports = new List<object>();
+
+                foreach (string rootName in requiredRootNames)
+                {
+                    try
+                    {
+                        string mappedTargetFileName = GetMappedTargetRootFileName(rootName, rootOverrides);
+                        bool specialMappingApplied = !string.IsNullOrEmpty(mappedTargetFileName);
+
+                        List<ModelItem> rootItems;
+                        if (specialMappingApplied)
+                        {
+                            rootItems = FindStartingNodesByModelFileName(
+                                document,
+                                mappedTargetFileName,
+                                ref nodesInspected);
+                        }
+                        else
+                        {
+                            rootItems = FindStartingNodes(
+                                document,
+                                rootName,
+                                ref nodesInspected);
+                        }
+
+                        List<TargetNodeInfo> indexedRoots = new List<TargetNodeInfo>();
+                        foreach (ModelItem rootItem in rootItems)
+                        {
+                            TargetNodeInfo indexedRoot = CreateTargetRoot(
+                                rootItem,
+                                ref nodesInspected,
+                                ref targetNodesIndexed);
+                            if (indexedRoot != null)
+                                indexedRoots.Add(indexedRoot);
+                        }
+
+                        indexedRootsByName[rootName] = indexedRoots;
+                        processedRootNames.Add(rootName);
+
+                        Dictionary<string, object> rootMappingReport =
+                            new Dictionary<string, object>();
+                        rootMappingReport["sourceRootName"] = rootName;
+                        rootMappingReport["mappingApplied"] = specialMappingApplied;
+                        rootMappingReport["lookupMode"] = specialMappingApplied
+                            ? "configured-rvt-file-name"
+                            : "exact-display-name";
+                        rootMappingReport["targetModelFileName"] = specialMappingApplied
+                            ? mappedTargetFileName
+                            : ExtractModelFileName(rootName);
+
+                        List<string> actualTargetRootNames = new List<string>();
+                        foreach (ModelItem rootItem in rootItems)
+                            actualTargetRootNames.Add(SafeDisplayName(rootItem));
+                        rootMappingReport["targetRootNamesFound"] = actualTargetRootNames;
+                        rootMappingReport["targetRootCount"] = rootItems.Count;
+                        rootMappingReport["mappingStatus"] = rootItems.Count == 0
+                            ? "TARGET_ROOT_NOT_FOUND"
+                            : (rootItems.Count == 1 ? "FOUND" : "MULTIPLE_TARGET_ROOTS_FOUND");
+                        rootMappingReports.Add(rootMappingReport);
+                    }
+                    catch (SearchLimitException)
+                    {
+                        searchLimitReached = true;
+                        break;
+                    }
+                }
+
+                foreach (ExpectedSet expectedSet in expectedSets)
+                {
+                    List<object> itemReports = new List<object>();
+                    int setUniqueMatches = 0;
+                    int setOneToManyCategoryMatches = 0;
+                    int setOneToManyIdentityMatches = 0;
+                    int setOneToManyStructuralMatches = 0;
+                    int setIdentityDisambiguatedMatches = 0;
+                    int setMissing = 0;
+                    int setAmbiguous = 0;
+                    int setSearchLimit = 0;
+                    int setIdentityWarnings = 0;
+                    Dictionary<string, ModelItem> targetItemsByPath =
+                        new Dictionary<string, ModelItem>(StringComparer.Ordinal);
+
+                    foreach (ExpectedItem expectedItem in expectedSet.Items)
+                    {
+                        List<string> expectedPathSegments = GetSourcePathSegments(expectedItem.HierarchyNodes);
+                        List<List<TargetNodeInfo>> candidatePaths = new List<List<TargetNodeInfo>>();
+                        string status = "MISSING";
+                        string targetPath = "";
+                        List<string> identityWarnings = new List<string>();
+                        int foundCount = 0;
+                        int candidateCountBeforeIdentityResolution = 0;
+                        bool identityDisambiguated = false;
+                        bool oneToManyMatch = false;
+                        string decisionReason = "NOT_EVALUATED";
+                        List<string> targetHierarchyPaths = new List<string>();
+
+                        if (expectedPathSegments.Count == 0)
+                        {
+                            status = "MISSING";
+                            decisionReason = "INVALID_OR_EMPTY_SOURCE_HIERARCHY_PATH";
+                        }
+                        else if (searchLimitReached || !processedRootNames.Contains(expectedPathSegments[0]))
+                        {
+                            // Once a global safety limit has been hit, do not start another
+                            // expensive search for each remaining source item. Their status is
+                            // explicitly inconclusive, not MISSING.
+                            status = "SEARCH_LIMIT_REACHED";
+                            decisionReason = "GLOBAL_SEARCH_LIMIT_REACHED_OR_ROOT_NOT_PROCESSED";
+                            searchLimitReached = true;
+                        }
+                        else
+                        {
+                            try
+                            {
+                                candidatePaths = FindPathsByHierarchy(
+                                    indexedRootsByName,
+                                    expectedPathSegments,
+                                    descendantMatchCache,
+                                    ref nodesInspected,
+                                    ref targetNodesIndexed,
+                                    ref targetPathSearchVisits);
+                                foundCount = candidatePaths.Count;
+                                candidateCountBeforeIdentityResolution = foundCount;
+
+                                // Identity values may disambiguate ordinary selected items.
+                                // Never use this to collapse a selected category into one branch.
+                                if (foundCount > 1 && !IsExpectedTerminalCategory(expectedItem))
+                                {
+                                    List<List<TargetNodeInfo>> identityResolvedPaths =
+                                        ResolveCandidatePathsByIdentity(expectedItem, candidatePaths);
+
+                                    if (identityResolvedPaths.Count == 1 && identityResolvedPaths.Count < foundCount)
+                                    {
+                                        candidatePaths = identityResolvedPaths;
+                                        foundCount = candidatePaths.Count;
+                                        identityDisambiguated = true;
+                                    }
+                                }
+                            }
+                            catch (SearchLimitException)
+                            {
+                                searchLimitReached = true;
+                                status = "SEARCH_LIMIT_REACHED";
+                                decisionReason = "PATH_SEARCH_LIMIT_REACHED";
+                            }
+                        }
+
+                        if (status != "SEARCH_LIMIT_REACHED")
+                        {
+                            if (foundCount == 0)
+                            {
+                                status = "MISSING";
+                                decisionReason = expectedPathSegments.Count == 0
+                                    ? "INVALID_OR_EMPTY_SOURCE_HIERARCHY_PATH"
+                                    : "NO_CANDIDATE_PATH";
+                                setMissing++;
+                                missingItems++;
+                            }
+                            else if (foundCount > 1)
+                            {
+                                string fanOutReason;
+                                if (IsExpectedTerminalCategory(expectedItem) &&
+                                    AllCandidatePathsTerminateInCategories(candidatePaths) &&
+                                    AllCandidatePathsShareTargetRoot(candidatePaths))
+                                {
+                                    status = "MATCHED_ONE_TO_MANY_CATEGORY";
+                                    decisionReason = "SOURCE_AND_TARGET_TERMINALS_ARE_CATEGORIES_IN_ONE_TARGET_ROOT";
+                                    oneToManyMatch = true;
+                                    setOneToManyCategoryMatches++;
+                                    oneToManyCategoryMatches++;
+                                    AddTargetHierarchyPaths(candidatePaths, targetHierarchyPaths);
+                                }
+                                else if (TryClassifyRepeatedCandidates(
+                                    expectedItem,
+                                    candidatePaths,
+                                    out status,
+                                    out fanOutReason))
+                                {
+                                    decisionReason = fanOutReason;
+                                    oneToManyMatch = true;
+                                    AddTargetHierarchyPaths(candidatePaths, targetHierarchyPaths);
+
+                                    if (status == "MATCHED_ONE_TO_MANY_IDENTITY")
+                                    {
+                                        setOneToManyIdentityMatches++;
+                                        oneToManyIdentityMatches++;
+                                    }
+                                    else if (status == "MATCHED_ONE_TO_MANY_STRUCTURAL")
+                                    {
+                                        setOneToManyStructuralMatches++;
+                                        oneToManyStructuralMatches++;
+                                    }
+                                }
+                                else
+                                {
+                                    status = "AMBIGUOUS";
+                                    decisionReason = fanOutReason;
+                                    setAmbiguous++;
+                                    ambiguousItems++;
+                                }
+                            }
+                            else
+                            {
+                                List<ModelItem> targetHierarchyNodes = ConvertToModelItems(candidatePaths[0]);
+                                TargetNodeInfo terminalNode = candidatePaths[0][candidatePaths[0].Count - 1];
+                                targetPath = BuildActualHierarchyPath(terminalNode);
+                                identityWarnings = CompareIdentityProperties(expectedItem, targetHierarchyNodes);
+
+                                setUniqueMatches++;
+                                uniqueMatches++;
+                                if (identityDisambiguated)
+                                {
+                                    setIdentityDisambiguatedMatches++;
+                                    identityDisambiguatedMatches++;
+                                    decisionReason = "IDENTITY_SELECTED_ONE_UNIQUE_PATH";
+                                }
+                                else
+                                {
+                                    decisionReason = "ONE_HIERARCHY_PATH_FOUND";
+                                }
+
+                                if (identityWarnings.Count > 0)
+                                {
+                                    status = "MATCHED_WITH_IDENTITY_WARNINGS";
+                                    decisionReason = "ONE_PATH_FOUND_BUT_IDENTITY_PROPERTIES_DIFFER_OR_ARE_UNAVAILABLE";
+                                    setIdentityWarnings += identityWarnings.Count;
+                                    identityWarningCount += identityWarnings.Count;
+                                }
+                                else
+                                {
+                                    status = "MATCHED";
+                                }
+                            }
+                        }
+
+                        // Retain only fully accepted matches for the optional transfer phase.
+                        // A single source item may contribute multiple target hierarchy nodes.
+                        if (IsTransferableItemStatus(status))
+                        {
+                            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+                            {
+                                if (candidatePath == null || candidatePath.Count == 0)
+                                    continue;
+
+                                TargetNodeInfo terminalNode = candidatePath[candidatePath.Count - 1];
+                                if (terminalNode == null || terminalNode.Item == null)
+                                    continue;
+
+                                string actualPath = BuildActualHierarchyPath(terminalNode);
+                                if (!string.IsNullOrWhiteSpace(actualPath) &&
+                                    !targetItemsByPath.ContainsKey(actualPath))
+                                {
+                                    targetItemsByPath.Add(actualPath, terminalNode.Item);
+                                }
+                            }
+                        }
+
+                        if (status == "SEARCH_LIMIT_REACHED")
+                        {
+                            setSearchLimit++;
+                            searchLimitItems++;
+                        }
+
+                        Dictionary<string, object> itemReport = new Dictionary<string, object>();
+                        itemReport["sourceDisplayName"] = expectedItem.DisplayName;
+                        itemReport["sourceHierarchyPath"] = expectedItem.SourceHierarchyPath;
+                        itemReport["status"] = status;
+                        itemReport["decision"] = status;
+                        itemReport["reasonCode"] = decisionReason;
+                        itemReport["sourceTerminalNodeType"] = GetExpectedTerminalNodeType(expectedItem);
+                        itemReport["sourceIdentityValues"] = BuildSourceIdentityValueReports(expectedItem);
+                        itemReport["candidateCount"] = foundCount;
+                        itemReport["candidateCountBeforeIdentityResolution"] = candidateCountBeforeIdentityResolution;
+                        itemReport["identityDisambiguated"] = identityDisambiguated;
+                        itemReport["targetHierarchyPath"] = targetPath;
+                        itemReport["targetHierarchyPaths"] = targetHierarchyPaths;
+                        itemReport["identityWarnings"] = identityWarnings;
+
+                        if (status == "AMBIGUOUS" || oneToManyMatch)
+                        {
+                            itemReport["candidatePaths"] = BuildCandidatePathReports(candidatePaths);
+                            itemReport["candidatePathsTruncated"] = foundCount > MaxCandidatePathsInReport;
+                        }
+
+                        itemReports.Add(itemReport);
+                    }
+
+                    resolvedTargetItemsBySet[expectedSet] = targetItemsByPath;
+
+                    Dictionary<string, object> setReport = new Dictionary<string, object>();
+                    setReport["name"] = expectedSet.Name;
+                    setReport["expectedItemCount"] = expectedSet.Items.Count;
+                    setReport["resolvedTargetModelItemCount"] = targetItemsByPath.Count;
+                    setReport["uniqueMatchCount"] = setUniqueMatches;
+                    setReport["oneToManyCategoryMatchCount"] = setOneToManyCategoryMatches;
+                    setReport["oneToManyIdentityMatchCount"] = setOneToManyIdentityMatches;
+                    setReport["oneToManyStructuralMatchCount"] = setOneToManyStructuralMatches;
+                    setReport["identityDisambiguatedCount"] = setIdentityDisambiguatedMatches;
+                    setReport["missingCount"] = setMissing;
+                    setReport["ambiguousCount"] = setAmbiguous;
+                    setReport["searchLimitCount"] = setSearchLimit;
+                    setReport["identityWarningCount"] = setIdentityWarnings;
+                    setReport["items"] = itemReports;
+                    setReports.Add(setReport);
+                }
+
+                bool transferApplied = false;
+                bool modelMayBeModified = false;
+                string transferStatus = applyTransfer ? "NOT_STARTED" : "NOT_REQUESTED";
+                string transferError = "";
+                int createdSelectionSetCount = 0;
+                int createdTargetModelItemCount = 0;
+
+                Dictionary<string, object> report = new Dictionary<string, object>();
+                report["reportFormatVersion"] = 8;
+                report["sourceDocumentTitle"] = GetDictionaryString(sourceDocument, "documentTitle");
+                report["sourceExportedAt"] = GetDictionaryString(sourceDocument, "exportedAt");
+                report["targetDocumentTitle"] = document.Title ?? "";
+                report["generatedAt"] = DateTime.Now.ToString(
+                    "yyyy-MM-dd HH:mm:ss",
+                    CultureInfo.InvariantCulture);
+                report["searchMethod"] = "indexed-linked-model-trees-with-cached-descendant-matches-identity-disambiguation-and-guarded-repeated-level-fan-out";
+                report["searchOptimization"] = "expand-LcRevitLayer-by-ModelItem.ClassName; expand-category-nodes-by-Element.Type; count-node-name-comparisons-once; stop-after-global-search-limit";
+                report["rootMappingPolicy"] = rootOverridesConfigExists
+                    ? "Exact display-name lookup by default; rootOverrides.json maps selected source RVT filenames to target RVT filenames."
+                    : "Exact display-name lookup only; rootOverrides.json was not found next to the selected source JSON.";
+                report["rootOverridesConfigPath"] = rootOverridesPath;
+                report["rootOverridesConfigLoaded"] = rootOverridesConfigExists;
+                report["rootOverridesCount"] = rootOverrides.Count;
+                report["rootMappings"] = rootMappingReports;
+                report["categoryFanOutRule"] = "source-and-target-terminal-nodes-are-categories-and-all-candidates-share-one-target-root";
+                report["identityFanOutRule"] = "all-source-identity-properties-including-a-GUID-property-match-every-candidate; candidates share one target root and repeat across distinct LcRevitLayer nodes with the same canonical path";
+                report["structuralFanOutRule"] = "source-and-target nodes have no readable identity values; candidates share one target root and repeat across distinct LcRevitLayer nodes with the same canonical path after level nodes are excluded";
+                report["maxIntermediateSearchDepth"] = MaxIntermediateSearchDepth;
+                report["targetNodesInspected"] = nodesInspected;
+                report["targetNodesIndexed"] = targetNodesIndexed;
+                report["targetPathSearchVisits"] = targetPathSearchVisits;
+                report["maxTargetPathSearchVisits"] = MaxPathSearchVisits;
+                report["candidatePathsIncludedForAmbiguousItems"] = MaxCandidatePathsInReport;
+                report["selectionSetCount"] = expectedSets.Count;
+                report["expectedItemCount"] = expectedItemCount;
+                report["uniqueMatchCount"] = uniqueMatches;
+                report["oneToManyCategoryMatchCount"] = oneToManyCategoryMatches;
+                report["identityDisambiguatedCount"] = identityDisambiguatedMatches;
+                report["oneToManyIdentityMatchCount"] = oneToManyIdentityMatches;
+                report["oneToManyStructuralMatchCount"] = oneToManyStructuralMatches;
+                report["resolvedItemCount"] = uniqueMatches + oneToManyCategoryMatches + oneToManyIdentityMatches + oneToManyStructuralMatches;
+                report["missingCount"] = missingItems;
+                report["ambiguousCount"] = ambiguousItems;
+                report["searchLimitItemCount"] = searchLimitItems;
+                report["identityWarningCount"] = identityWarningCount;
+                report["searchLimitReached"] = searchLimitReached;
+                report["transferRequested"] = applyTransfer;
+                report["transferStatus"] = transferStatus;
+                report["transferError"] = transferError;
+                report["createdSelectionSetCount"] = createdSelectionSetCount;
+                report["createdTargetModelItemCount"] = createdTargetModelItemCount;
+                report["modelWasModified"] = false;
+                report["selectionSets"] = setReports;
+
+                using (SaveFileDialog dialog = new SaveFileDialog())
+                {
+                    dialog.Title = applyTransfer
+                        ? "Сохранить отчёт переноса Selection Sets"
+                        : "Сохранить отчёт проверки Selection Sets";
+                    dialog.Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
+                    dialog.FileName = (applyTransfer
+                        ? "NavisCoordinator_TransferReport_"
+                        : "NavisCoordinator_MatchReport_") +
+                        DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json";
+                    dialog.InitialDirectory = Environment.GetFolderPath(
+                        Environment.SpecialFolder.Desktop);
+
+                    // Pick the report path before any document mutation. Canceling this
+                    // dialog therefore guarantees that the target document remains untouched.
+                    if (dialog.ShowDialog() != DialogResult.OK)
+                        return;
+
+                    if (string.Equals(dialog.FileName, sourceJsonPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        MessageBox.Show(
+                            "Нельзя сохранять отчёт поверх исходного JSON Selection Sets. Выберите другое имя файла.",
+                            "Navis Coordinator — неверный путь отчёта",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    if (applyTransfer)
+                    {
+                        string validationDetails;
+                        if (!ValidateTransferPreconditions(
+                            document,
+                            expectedSets,
+                            resolvedTargetItemsBySet,
+                            rootMappingReports,
+                            expectedItemCount,
+                            uniqueMatches + oneToManyCategoryMatches +
+                                oneToManyIdentityMatches + oneToManyStructuralMatches,
+                            missingItems,
+                            ambiguousItems,
+                            searchLimitItems,
+                            identityWarningCount,
+                            searchLimitReached,
+                            out validationDetails))
+                        {
+                            transferStatus = "BLOCKED_PREFLIGHT";
+                            transferError = validationDetails;
+                            MessageBox.Show(
+                                "Перенос не выполнен. Предварительная проверка не пройдена:\n\n" +
+                                validationDetails +
+                                "\n\nДокумент не изменён. Отчёт будет сохранён.",
+                                "Navis Coordinator — перенос заблокирован",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Warning);
+                        }
+                        else
+                        {
+                            int targetItemTotal = CountResolvedTargetItems(
+                                expectedSets, resolvedTargetItemsBySet);
+                            DialogResult transferChoice = MessageBox.Show(
+                                "Предварительная проверка пройдена.\n\n" +
+                                "Целевой документ: " + (document.Title ?? "") + "\n" +
+                                "Selection Sets для создания: " + expectedSets.Count + "\n" +
+                                "Суммарно уникальных целевых узлов во всех наборах: " + targetItemTotal + "\n\n" +
+                                "ВАЖНО: продолжайте только если открыт РАБОЧИЙ КЛОН целевого NWF.\n" +
+                                "Существующие наборы с такими именами не перезаписываются.\n" +
+                                "Документ будет изменён в памяти; автоматического сохранения на диск не будет.\n\n" +
+                                "Создать Selection Sets?",
+                                "Navis Coordinator — подтверждение переноса",
+                                MessageBoxButtons.YesNo,
+                                MessageBoxIcon.Warning);
+
+                            if (transferChoice == DialogResult.Yes)
+                            {
+                                try
+                                {
+                                    CreateSelectionSets(
+                                        document,
+                                        expectedSets,
+                                        resolvedTargetItemsBySet,
+                                        out createdSelectionSetCount,
+                                        out createdTargetModelItemCount);
+                                    transferApplied = true;
+                                    modelMayBeModified = true;
+                                    transferStatus = "APPLIED_UNSAVED";
+                                    transferError = "";
+                                }
+                                catch (Exception transferException)
+                                {
+                                    bool rollbackIncomplete = transferException.Message.IndexOf(
+                                        "При попытке отката возникли проблемы",
+                                        StringComparison.OrdinalIgnoreCase) >= 0;
+                                    transferStatus = rollbackIncomplete
+                                        ? "FAILED_ROLLBACK_INCOMPLETE"
+                                        : "FAILED_ROLLED_BACK";
+                                    modelMayBeModified = rollbackIncomplete;
+                                    transferError = transferException.ToString();
+                                    MessageBox.Show(
+                                        "Во время создания Selection Sets произошла ошибка.\n\n" +
+                                        transferException.Message +
+                                        "\n\nПлагин попытался удалить наборы, созданные в рамках этой операции.\n" +
+                                        "Проверьте окно Selection Sets и не сохраняйте документ, пока не убедитесь в результате.\n\n" +
+                                        "Полная ошибка записана в JSON-отчёт.",
+                                        "Navis Coordinator — ошибка переноса",
+                                        MessageBoxButtons.OK,
+                                        MessageBoxIcon.Error);
+                                }
+                            }
+                            else
+                            {
+                                transferStatus = "CANCELLED_BY_USER";
+                            }
+                        }
+                    }
+
+                    report["transferStatus"] = transferStatus;
+                    report["transferError"] = transferError;
+                    report["createdSelectionSetCount"] = createdSelectionSetCount;
+                    report["createdTargetModelItemCount"] = createdTargetModelItemCount;
+                    report["modelWasModified"] = modelMayBeModified;
+
+                    string compactJson = serializer.Serialize(report);
+                    string formattedJson = PrettyPrintJson(compactJson);
+                    File.WriteAllText(dialog.FileName, formattedJson, new UTF8Encoding(false));
+
+                    ShowSummary(
+                        dialog.FileName,
+                        GetDictionaryString(sourceDocument, "documentTitle"),
+                        document.Title ?? "",
+                        expectedSets.Count,
+                        expectedItemCount,
+                        uniqueMatches,
+                        oneToManyCategoryMatches,
+                        oneToManyIdentityMatches,
+                        oneToManyStructuralMatches,
+                        identityDisambiguatedMatches,
+                        missingItems,
+                        ambiguousItems,
+                        searchLimitItems,
+                        identityWarningCount,
+                        nodesInspected,
+                        targetNodesIndexed,
+                        targetPathSearchVisits,
+                        searchLimitReached,
+                        applyTransfer,
+                        transferApplied,
+                        transferStatus,
+                        createdSelectionSetCount,
+                        createdTargetModelItemCount,
+                        transferError);
+                }
+            }
+            catch (Exception exception)
+            {
+                string actionName = applyTransfer
+                    ? "переносе Selection Sets"
+                    : "проверке соответствий Selection Sets";
+                string recoveryNote = applyTransfer
+                    ? "\n\nЕсли вы уже подтвердили перенос, проверьте текущее окно Sets. NWF автоматически не сохранялся."
+                    : "";
+
+                MessageBox.Show(
+                    "Ошибка при " + actionName + ":\n\n" + exception + recoveryNote,
+                    "Navis Coordinator",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
+        private static bool IsTransferableItemStatus(string status)
+        {
+            return string.Equals(status, "MATCHED", StringComparison.Ordinal) ||
+                   string.Equals(status, "MATCHED_ONE_TO_MANY_CATEGORY", StringComparison.Ordinal) ||
+                   string.Equals(status, "MATCHED_ONE_TO_MANY_IDENTITY", StringComparison.Ordinal) ||
+                   string.Equals(status, "MATCHED_ONE_TO_MANY_STRUCTURAL", StringComparison.Ordinal);
+        }
+
+        private static bool ValidateTransferPreconditions(
+            Document document,
+            List<ExpectedSet> expectedSets,
+            Dictionary<ExpectedSet, Dictionary<string, ModelItem>> resolvedTargetItemsBySet,
+            List<object> rootMappingReports,
+            int expectedItemCount,
+            int resolvedItemCount,
+            int missingItems,
+            int ambiguousItems,
+            int searchLimitItems,
+            int identityWarningCount,
+            bool searchLimitReached,
+            out string details)
+        {
+            List<string> problems = new List<string>();
+
+            if (document == null || document.IsClear)
+                problems.Add("Нет открытого целевого документа.");
+
+            if (expectedSets == null || expectedSets.Count == 0)
+                problems.Add("В исходном JSON нет наборов для переноса.");
+
+            if (expectedItemCount == 0 || resolvedItemCount != expectedItemCount)
+                problems.Add("Разрешено узлов: " + resolvedItemCount + " из " + expectedItemCount + ".");
+
+            if (missingItems != 0)
+                problems.Add("Не найдено исходных узлов: " + missingItems + ".");
+
+            if (ambiguousItems != 0)
+                problems.Add("Остались неоднозначные соответствия: " + ambiguousItems + ".");
+
+            if (searchLimitItems != 0 || searchLimitReached)
+                problems.Add("Поиск завершился по лимиту; перенос в таком состоянии запрещён.");
+
+            if (identityWarningCount != 0)
+                problems.Add("Есть предупреждения по идентификаторам: " + identityWarningCount + ".");
+
+            HashSet<string> sourceSetNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (expectedSets != null)
+            {
+                foreach (ExpectedSet expectedSet in expectedSets)
+                {
+                    if (expectedSet == null || string.IsNullOrWhiteSpace(expectedSet.Name))
+                    {
+                        problems.Add("Обнаружен Selection Set без имени.");
+                        continue;
+                    }
+
+                    if (!sourceSetNames.Add(expectedSet.Name))
+                        problems.Add("В исходном JSON повторяется имя набора '" + expectedSet.Name + "'.");
+
+                    Dictionary<string, ModelItem> resolvedItems;
+                    if (resolvedTargetItemsBySet == null ||
+                        !resolvedTargetItemsBySet.TryGetValue(expectedSet, out resolvedItems) ||
+                        resolvedItems == null || resolvedItems.Count == 0)
+                    {
+                        problems.Add("Для набора '" + expectedSet.Name + "' не найдено целевых узлов.");
+                    }
+                }
+            }
+
+            if (rootMappingReports == null || rootMappingReports.Count == 0)
+            {
+                problems.Add("Отчёт сопоставления корней пуст.");
+            }
+            else
+            {
+                foreach (object rawMapping in rootMappingReports)
+                {
+                    Dictionary<string, object> mapping = AsDictionary(rawMapping);
+                    if (mapping == null)
+                    {
+                        problems.Add("Не удалось прочитать запись сопоставления корня.");
+                        continue;
+                    }
+
+                    string mappingStatus = GetDictionaryString(mapping, "mappingStatus");
+                    int targetRootCount = ToInt32(GetDictionaryValue(mapping, "targetRootCount"));
+                    string sourceRootName = GetDictionaryString(mapping, "sourceRootName");
+
+                    if (!string.Equals(mappingStatus, "FOUND", StringComparison.Ordinal) || targetRootCount != 1)
+                    {
+                        problems.Add("Корень '" + sourceRootName + "': статус=" + mappingStatus +
+                                     ", найдено целевых корней=" + targetRootCount + ". Требуется ровно один.");
+                    }
+                }
+            }
+
+            if (document != null && !document.IsClear)
+            {
+                HashSet<string> existingNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                CollectSavedItemNames(document.SelectionSets.RootItem.Children, existingNames);
+                if (expectedSets != null)
+                {
+                    foreach (ExpectedSet expectedSet in expectedSets)
+                    {
+                        if (expectedSet != null && !string.IsNullOrWhiteSpace(expectedSet.Name) &&
+                            existingNames.Contains(expectedSet.Name))
+                        {
+                            problems.Add("В целевом документе уже существует набор или папка с именем '" +
+                                         expectedSet.Name + "'. Ничего не будет перезаписано.");
+                        }
+                    }
+                }
+            }
+
+            details = problems.Count == 0 ? "" : string.Join(Environment.NewLine, problems.ToArray());
+            return problems.Count == 0;
+        }
+
+        private static int ToInt32(object value)
+        {
+            if (value == null)
+                return 0;
+
+            try
+            {
+                return Convert.ToInt32(value, CultureInfo.InvariantCulture);
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private static void CollectSavedItemNames(SavedItemCollection collection, HashSet<string> names)
+        {
+            if (collection == null || names == null)
+                return;
+
+            foreach (SavedItem savedItem in collection)
+            {
+                if (savedItem == null)
+                    continue;
+
+                if (!string.IsNullOrWhiteSpace(savedItem.DisplayName))
+                    names.Add(savedItem.DisplayName);
+
+                FolderItem folder = savedItem as FolderItem;
+                if (folder != null)
+                    CollectSavedItemNames(folder.Children, names);
+            }
+        }
+
+        private static SavedItem FindTopLevelSavedItemByName(Document document, string displayName)
+        {
+            if (document == null || document.IsClear || string.IsNullOrWhiteSpace(displayName))
+                return null;
+
+            foreach (SavedItem savedItem in document.SelectionSets.RootItem.Children)
+            {
+                if (savedItem != null &&
+                    string.Equals(savedItem.DisplayName ?? "", displayName, StringComparison.Ordinal))
+                    return savedItem;
+            }
+
+            return null;
+        }
+
+        private static int CountResolvedTargetItems(
+            List<ExpectedSet> expectedSets,
+            Dictionary<ExpectedSet, Dictionary<string, ModelItem>> resolvedTargetItemsBySet)
+        {
+            int count = 0;
+            if (expectedSets == null || resolvedTargetItemsBySet == null)
+                return count;
+
+            foreach (ExpectedSet expectedSet in expectedSets)
+            {
+                Dictionary<string, ModelItem> targetItems;
+                if (resolvedTargetItemsBySet.TryGetValue(expectedSet, out targetItems) && targetItems != null)
+                    count += targetItems.Count;
+            }
+
+            return count;
+        }
+
+        private static void CreateSelectionSets(
+            Document document,
+            List<ExpectedSet> expectedSets,
+            Dictionary<ExpectedSet, Dictionary<string, ModelItem>> resolvedTargetItemsBySet,
+            out int createdSelectionSetCount,
+            out int createdTargetModelItemCount)
+        {
+            createdSelectionSetCount = 0;
+            createdTargetModelItemCount = 0;
+            List<string> addedSetNames = new List<string>();
+            Dictionary<string, int> addedSetItemCounts =
+                new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                foreach (ExpectedSet expectedSet in expectedSets)
+                {
+                    Dictionary<string, ModelItem> targetItemsByPath;
+                    if (!resolvedTargetItemsBySet.TryGetValue(expectedSet, out targetItemsByPath) ||
+                        targetItemsByPath == null || targetItemsByPath.Count == 0)
+                    {
+                        throw new InvalidOperationException(
+                            "Для Selection Set '" + expectedSet.Name + "' не подготовлены целевые узлы.");
+                    }
+
+                    ModelItemCollection targetItems = new ModelItemCollection();
+                    foreach (KeyValuePair<string, ModelItem> pair in targetItemsByPath)
+                    {
+                        if (pair.Value != null)
+                            targetItems.Add(pair.Value);
+                    }
+
+                    if (targetItems.Count == 0)
+                    {
+                        throw new InvalidOperationException(
+                            "Selection Set '" + expectedSet.Name + "' после удаления пустых ссылок не содержит узлов.");
+                    }
+
+                    SelectionSet newSet = new SelectionSet(targetItems);
+                    newSet.DisplayName = expectedSet.Name;
+                    document.SelectionSets.AddCopy(newSet);
+                    addedSetNames.Add(expectedSet.Name);
+                    addedSetItemCounts[expectedSet.Name] = targetItems.Count;
+
+                    SavedItem addedItem = FindTopLevelSavedItemByName(document, expectedSet.Name);
+                    if (addedItem == null)
+                    {
+                        throw new InvalidOperationException(
+                            "Navisworks добавил набор '" + expectedSet.Name + "', но плагин не смог проверить его наличие в корне Sets.");
+                    }
+
+                    createdSelectionSetCount++;
+                    createdTargetModelItemCount += targetItems.Count;
+                }
+            }
+            catch (Exception originalException)
+            {
+                List<string> rollbackProblems = new List<string>();
+                for (int index = addedSetNames.Count - 1; index >= 0; index--)
+                {
+                    string setName = addedSetNames[index];
+                    try
+                    {
+                        SavedItem addedItem = FindTopLevelSavedItemByName(document, setName);
+                        // A null item means it is already absent, so rollback has nothing left to do.
+                        if (addedItem != null && !document.SelectionSets.Remove(addedItem))
+                            rollbackProblems.Add("Не удалось удалить набор '" + setName + "'.");
+                    }
+                    catch (Exception rollbackException)
+                    {
+                        rollbackProblems.Add("'" + setName + "': " + rollbackException.Message);
+                    }
+                }
+
+                if (rollbackProblems.Count > 0)
+                {
+                    // Report the sets that still appear in the document after rollback attempts.
+                    createdSelectionSetCount = 0;
+                    createdTargetModelItemCount = 0;
+                    foreach (string setName in addedSetNames)
+                    {
+                        if (FindTopLevelSavedItemByName(document, setName) == null)
+                            continue;
+
+                        createdSelectionSetCount++;
+                        int itemCount;
+                        if (addedSetItemCounts.TryGetValue(setName, out itemCount))
+                            createdTargetModelItemCount += itemCount;
+                    }
+
+                    throw new InvalidOperationException(
+                        "Создание Selection Sets завершилось ошибкой. При попытке отката возникли проблемы:\n" +
+                        string.Join(Environment.NewLine, rollbackProblems.ToArray()) +
+                        "\nИсходная ошибка: " + originalException.Message,
+                        originalException);
+                }
+
+                createdSelectionSetCount = 0;
+                createdTargetModelItemCount = 0;
+                throw new InvalidOperationException(
+                    "Создание Selection Sets завершилось ошибкой. Наборы, добавленные этой операцией, удалены.\n" +
+                    originalException.Message,
+                    originalException);
+            }
+        }
+
+        // Diagnostic export only: this method reads the model tree and writes CSV.
+        // It deliberately does not touch PropertyCategories, DataProperty, or SelectionSets.
+        private const int MaxDumpNodesPerModel = 500000;
+
+        private static void RunTreeDump(Document document)
+        {
+            if (document == null || document.Models == null)
+            {
+                MessageBox.Show(
+                    "Нет открытого документа или загруженных моделей.",
+                    "Navis Coordinator — дамп дерева",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            using (FolderBrowserDialog dialog = new FolderBrowserDialog())
+            {
+                dialog.Description = "Выберите папку для диагностических CSV-файлов дерева Navisworks.";
+                dialog.SelectedPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+                dialog.ShowNewFolderButton = true;
+
+                if (dialog.ShowDialog() != DialogResult.OK)
+                    return;
+
+                int modelIndex = 0;
+                int totalRows = 0;
+                int filesWritten = 0;
+                List<string> outputFiles = new List<string>();
+
+                foreach (Model model in document.Models)
+                {
+                    if (model == null || model.RootItem == null)
+                        continue;
+
+                    modelIndex++;
+                    string rootName = SafeDisplayName(model.RootItem);
+                    string safeRootName = SafeFileNamePart(rootName);
+                    if (string.IsNullOrWhiteSpace(safeRootName))
+                        safeRootName = "Model";
+
+                    string fileName = "NavisCoordinator_TreeDump_" +
+                                      DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) +
+                                      "_" + modelIndex.ToString("D2", CultureInfo.InvariantCulture) +
+                                      "_" + safeRootName + ".csv";
+                    string filePath = Path.Combine(dialog.SelectedPath, fileName);
+                    bool truncated;
+                    int rows = DumpOneModelTree(model.RootItem, filePath, out truncated);
+
+                    totalRows += rows;
+                    filesWritten++;
+                    outputFiles.Add(fileName + " — строк: " + rows +
+                                    (truncated ? " (достигнут лимит узлов)" : ""));
+                }
+
+                if (filesWritten == 0)
+                {
+                    MessageBox.Show(
+                        "В документе не обнаружены корневые узлы загруженных моделей.",
+                        "Navis Coordinator — дамп дерева",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                StringBuilder message = new StringBuilder();
+                message.AppendLine("Диагностический дамп завершён. Модель не изменялась.");
+                message.AppendLine();
+                message.AppendLine("Файлов: " + filesWritten);
+                message.AppendLine("Строк дерева: " + totalRows);
+                message.AppendLine("Папка: " + dialog.SelectedPath);
+                message.AppendLine();
+                foreach (string outputFile in outputFiles)
+                    message.AppendLine(outputFile);
+
+                MessageBox.Show(
+                    message.ToString(),
+                    "Navis Coordinator — дамп дерева",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+        }
+
+        private static int DumpOneModelTree(ModelItem root, string filePath, out bool truncated)
+        {
+            truncated = false;
+            if (root == null)
+                return 0;
+
+            int rowsWritten = 0;
+            int nextId = 1;
+            Queue<TreeDumpQueueItem> queue = new Queue<TreeDumpQueueItem>();
+
+            string rootName = SafeDisplayName(root);
+            TreeDumpQueueItem rootEntry = new TreeDumpQueueItem();
+            rootEntry.Item = root;
+            rootEntry.Id = 0;
+            rootEntry.ParentId = -1;
+            rootEntry.Depth = 0;
+            queue.Enqueue(rootEntry);
+
+            using (StreamWriter writer = new StreamWriter(filePath, false, new UTF8Encoding(true)))
+            {
+                writer.WriteLine(
+                    "id;parentId;depth;childCount;hasGeometry;className;classDisplayName;displayName;childrenStatus");
+
+                while (queue.Count > 0)
+                {
+                    TreeDumpQueueItem entry = queue.Dequeue();
+                    List<ModelItem> children = new List<ModelItem>();
+                    string childrenStatus = "OK";
+
+                    try
+                    {
+                        foreach (ModelItem child in entry.Item.Children)
+                        {
+                            if (child == null)
+                                continue;
+
+                            if (nextId >= MaxDumpNodesPerModel)
+                            {
+                                truncated = true;
+                                childrenStatus = "NODE_LIMIT_REACHED";
+                                break;
+                            }
+
+                            string childName = SafeDisplayName(child);
+                            TreeDumpQueueItem childEntry = new TreeDumpQueueItem();
+                            childEntry.Item = child;
+                            childEntry.Id = nextId++;
+                            childEntry.ParentId = entry.Id;
+                            childEntry.Depth = entry.Depth + 1;
+
+                            children.Add(child);
+                            queue.Enqueue(childEntry);
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        childrenStatus = "CHILDREN_READ_ERROR:" + exception.GetType().Name;
+                    }
+
+                    string displayName = SafeDisplayName(entry.Item);
+                    string className = SafeModelItemClassName(entry.Item);
+                    string classDisplayName = SafeModelItemClassDisplayName(entry.Item);
+                    string hasGeometry = SafeModelItemHasGeometry(entry.Item);
+
+                    writer.WriteLine(
+                        entry.Id.ToString(CultureInfo.InvariantCulture) + ";" +
+                        entry.ParentId.ToString(CultureInfo.InvariantCulture) + ";" +
+                        entry.Depth.ToString(CultureInfo.InvariantCulture) + ";" +
+                        children.Count.ToString(CultureInfo.InvariantCulture) + ";" +
+                        CsvField(hasGeometry) + ";" +
+                        CsvField(className) + ";" +
+                        CsvField(classDisplayName) + ";" +
+                        CsvField(displayName) + ";" +
+                        CsvField(childrenStatus));
+
+                    rowsWritten++;
+                }
+
+                if (truncated)
+                {
+                    writer.WriteLine(
+                        "#;#;#;#;#;#;#;#;" +
+                        CsvField("TRUNCATED: достигнут MaxDumpNodesPerModel=" +
+                                 MaxDumpNodesPerModel.ToString(CultureInfo.InvariantCulture)));
+                }
+            }
+
+            return rowsWritten;
+        }
+
+        private static string SafeModelItemClassName(ModelItem item)
+        {
+            try { return item == null ? "" : item.ClassName ?? ""; }
+            catch (Exception exception) { return "<ERR:" + exception.GetType().Name + ">"; }
+        }
+
+        private static string SafeModelItemClassDisplayName(ModelItem item)
+        {
+            try { return item == null ? "" : item.ClassDisplayName ?? ""; }
+            catch (Exception exception) { return "<ERR:" + exception.GetType().Name + ">"; }
+        }
+
+        private static string SafeModelItemHasGeometry(ModelItem item)
+        {
+            try { return item == null ? "" : item.HasGeometry.ToString(); }
+            catch (Exception exception) { return "<ERR:" + exception.GetType().Name + ">"; }
+        }
+
+        private static string CsvField(string value)
+        {
+            if (value == null)
+                value = "";
+            return "\"" + value.Replace("\"", "\"\"") + "\"";
+        }
+
+        private static string SafeFileNamePart(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+
+            StringBuilder builder = new StringBuilder(value.Length);
+            foreach (char character in value)
+            {
+                if (Array.IndexOf(Path.GetInvalidFileNameChars(), character) >= 0 ||
+                    char.IsControl(character))
+                {
+                    builder.Append('_');
+                }
+                else
+                {
+                    builder.Append(character);
+                }
+            }
+
+            string result = builder.ToString().Trim().Trim('.');
+            if (result.Length > 80)
+                result = result.Substring(0, 80);
+            return result;
+        }
+
+        private sealed class TreeDumpQueueItem
+        {
+            public ModelItem Item;
+            public int Id;
+            public int ParentId;
+            public int Depth;
+        }
+
+        private static List<string> GetRequiredRootNames(List<ExpectedSet> expectedSets)
+        {
+            List<string> roots = new List<string>();
+            HashSet<string> seenNames = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (ExpectedSet expectedSet in expectedSets)
+            {
+                foreach (ExpectedItem expectedItem in expectedSet.Items)
+                {
+                    List<string> pathSegments = GetSourcePathSegments(expectedItem.HierarchyNodes);
+                    if (pathSegments.Count == 0)
+                        continue;
+
+                    string rootName = pathSegments[0];
+                    if (seenNames.Add(rootName))
+                        roots.Add(rootName);
+                }
+            }
+
+            return roots;
+        }
+
+        // Optional configuration is stored as rootOverrides.json next to the selected
+        // source JSON. Keys and values are linked RVT file names, not Navisworks display
+        // names, because Navisworks appends a position suffix (e.g. ": 9 : position").
+        private static Dictionary<string, string> LoadRootOverrides(
+            string configPath,
+            JavaScriptSerializer serializer)
+        {
+            Dictionary<string, string> overrides =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            if (string.IsNullOrWhiteSpace(configPath) || !File.Exists(configPath))
+                return overrides;
+
+            if (serializer == null)
+                throw new ArgumentNullException("serializer");
+
+            object parsed = serializer.DeserializeObject(File.ReadAllText(configPath, Encoding.UTF8));
+            Dictionary<string, object> config = AsDictionary(parsed);
+            if (config == null)
+                throw new InvalidDataException("В корне файла ожидается JSON-объект.");
+
+            int formatVersion = 0;
+            object versionValue = GetDictionaryValue(config, "formatVersion");
+            if (versionValue == null ||
+                !int.TryParse(Convert.ToString(versionValue, CultureInfo.InvariantCulture), out formatVersion) ||
+                formatVersion != 1)
+            {
+                throw new InvalidDataException("Ожидается formatVersion = 1.");
+            }
+
+            object overridesValue = GetDictionaryValue(config, "overrides");
+            if (overridesValue == null)
+                throw new InvalidDataException("Не найден массив 'overrides'.");
+
+            List<object> rawOverrides = AsObjectList(overridesValue);
+            HashSet<string> targetFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (object rawOverride in rawOverrides)
+            {
+                Dictionary<string, object> overrideItem = AsDictionary(rawOverride);
+                if (overrideItem == null)
+                    throw new InvalidDataException("Каждый элемент 'overrides' должен быть JSON-объектом.");
+
+                string sourceFileName = ExtractModelFileName(
+                    GetDictionaryString(overrideItem, "sourceModelFileName"));
+                string targetFileName = ExtractModelFileName(
+                    GetDictionaryString(overrideItem, "targetModelFileName"));
+
+                if (string.IsNullOrWhiteSpace(sourceFileName) ||
+                    string.IsNullOrWhiteSpace(targetFileName))
+                {
+                    throw new InvalidDataException(
+                        "У каждого правила обязательны sourceModelFileName и targetModelFileName с расширением .rvt.");
+                }
+
+                if (overrides.ContainsKey(sourceFileName))
+                    throw new InvalidDataException("Повторный sourceModelFileName: " + sourceFileName);
+
+                if (!targetFileNames.Add(targetFileName))
+                {
+                    throw new InvalidDataException(
+                        "Несколько исходных моделей назначены на одну целевую модель: " + targetFileName);
+                }
+
+                overrides.Add(sourceFileName, targetFileName);
+            }
+
+            return overrides;
+        }
+
+        private static string GetMappedTargetRootFileName(
+            string sourceRootDisplayName,
+            Dictionary<string, string> rootOverrides)
+        {
+            if (rootOverrides == null || string.IsNullOrWhiteSpace(sourceRootDisplayName))
+                return "";
+
+            string sourceFileName = ExtractModelFileName(sourceRootDisplayName);
+            string targetFileName;
+            return rootOverrides.TryGetValue(sourceFileName, out targetFileName)
+                ? targetFileName
+                : "";
+        }
+
+        // Navisworks appends a model-position label after the linked RVT filename,
+        // e.g. "...ОВ1_П3_R23.rvt : 9 : позиция ...". Extract only the .rvt filename.
+        private static string ExtractModelFileName(string displayName)
+        {
+            if (string.IsNullOrWhiteSpace(displayName))
+                return "";
+
+            int extensionIndex = displayName.IndexOf(".rvt", StringComparison.OrdinalIgnoreCase);
+            if (extensionIndex < 0)
+                return "";
+
+            string filePathPrefix = displayName.Substring(0, extensionIndex + 4).Trim();
+            int lastSlash = filePathPrefix.LastIndexOf('/');
+            int lastBackslash = filePathPrefix.LastIndexOf('\\');
+            int lastSeparator = Math.Max(lastSlash, lastBackslash);
+            if (lastSeparator >= 0 && lastSeparator < filePathPrefix.Length - 1)
+                filePathPrefix = filePathPrefix.Substring(lastSeparator + 1);
+
+            return filePathPrefix.Trim();
+        }
+
+        private static List<ModelItem> FindStartingNodesByModelFileName(
+            Document document,
+            string requiredModelFileName,
+            ref int nodesInspected)
+        {
+            List<ModelItem> matches = new List<ModelItem>();
+            if (document == null || document.Models == null ||
+                string.IsNullOrWhiteSpace(requiredModelFileName))
+            {
+                return matches;
+            }
+
+            foreach (Model model in document.Models)
+            {
+                if (model == null || model.RootItem == null)
+                    continue;
+
+                matches.AddRange(FindStartingNodesByModelFileName(
+                    model.RootItem,
+                    requiredModelFileName,
+                    ref nodesInspected));
+            }
+
+            return matches;
+        }
+
+        private static List<ModelItem> FindStartingNodesByModelFileName(
+            ModelItem documentRoot,
+            string requiredModelFileName,
+            ref int nodesInspected)
+        {
+            List<ModelItem> currentLayer = new List<ModelItem>();
+            if (documentRoot == null || string.IsNullOrWhiteSpace(requiredModelFileName))
+                return currentLayer;
+
+            currentLayer.Add(documentRoot);
+
+            for (int depth = 0; depth <= MaxRootSearchDepth; depth++)
+            {
+                List<ModelItem> matches = new List<ModelItem>();
+                foreach (ModelItem item in currentLayer)
+                {
+                    CountInspectedNode(ref nodesInspected);
+                    string itemFileName = ExtractModelFileName(SafeDisplayName(item));
+                    if (string.Equals(
+                        itemFileName,
+                        requiredModelFileName,
+                        StringComparison.OrdinalIgnoreCase))
+                    {
+                        matches.Add(item);
+                    }
+                }
+
+                if (matches.Count > 0)
+                    return matches;
+
+                if (depth == MaxRootSearchDepth)
+                    break;
+
+                List<ModelItem> nextLayer = new List<ModelItem>();
+                foreach (ModelItem item in currentLayer)
+                    nextLayer.AddRange(GetChildrenSafely(item, ref nodesInspected));
+
+                currentLayer = nextLayer;
+                if (currentLayer.Count == 0)
+                    break;
+            }
+
+            return new List<ModelItem>();
+        }
+
+        private static List<ModelItem> FindStartingNodes(
+            Document document,
+            string requiredName,
+            ref int nodesInspected)
+        {
+            List<ModelItem> matches = new List<ModelItem>();
+            if (document == null || document.Models == null || string.IsNullOrEmpty(requiredName))
+                return matches;
+
+            foreach (Model model in document.Models)
+            {
+                if (model == null || model.RootItem == null)
+                    continue;
+
+                matches.AddRange(FindStartingNodes(model.RootItem, requiredName, ref nodesInspected));
+            }
+
+            return matches;
+        }
+
+        private static List<ModelItem> FindStartingNodes(
+            ModelItem documentRoot,
+            string requiredName,
+            ref int nodesInspected)
+        {
+            List<ModelItem> currentLayer = new List<ModelItem>();
+            if (documentRoot == null || string.IsNullOrEmpty(requiredName))
+                return currentLayer;
+
+            currentLayer.Add(documentRoot);
+
+            for (int depth = 0; depth <= MaxRootSearchDepth; depth++)
+            {
+                List<ModelItem> matches = new List<ModelItem>();
+                foreach (ModelItem item in currentLayer)
+                {
+                    CountInspectedNode(ref nodesInspected);
+                    if (string.Equals(SafeDisplayName(item), requiredName, StringComparison.Ordinal))
+                        matches.Add(item);
+                }
+
+                if (matches.Count > 0)
+                    return matches;
+
+                if (depth == MaxRootSearchDepth)
+                    break;
+
+                List<ModelItem> nextLayer = new List<ModelItem>();
+                foreach (ModelItem item in currentLayer)
+                    nextLayer.AddRange(GetChildrenSafely(item, ref nodesInspected));
+
+                currentLayer = nextLayer;
+                if (currentLayer.Count == 0)
+                    break;
+            }
+
+            return new List<ModelItem>();
+        }
+
+        private static TargetNodeInfo CreateTargetRoot(
+            ModelItem rootItem,
+            ref int nodesInspected,
+            ref int targetNodesIndexed)
+        {
+            if (rootItem == null)
+                return null;
+
+            CountInspectedNode(ref nodesInspected);
+            targetNodesIndexed++;
+
+            TargetNodeInfo root = new TargetNodeInfo();
+            root.Item = rootItem;
+            root.DisplayName = SafeDisplayName(rootItem);
+            root.Parent = null;
+            root.Depth = 0;
+            root.ChildrenLoaded = false;
+            return root;
+        }
+
+        private static List<List<TargetNodeInfo>> FindPathsByHierarchy(
+            Dictionary<string, List<TargetNodeInfo>> indexedRootsByName,
+            List<string> pathSegments,
+            Dictionary<TargetNodeInfo, Dictionary<string, List<TargetNodeInfo>>> descendantMatchCache,
+            ref int nodesInspected,
+            ref int targetNodesIndexed,
+            ref int targetPathSearchVisits)
+        {
+            List<List<TargetNodeInfo>> completedPaths = new List<List<TargetNodeInfo>>();
+            if (indexedRootsByName == null || pathSegments == null || pathSegments.Count == 0)
+                return completedPaths;
+
+            List<TargetNodeInfo> startingNodes;
+            if (!indexedRootsByName.TryGetValue(pathSegments[0], out startingNodes))
+                return completedPaths;
+
+            List<List<TargetNodeInfo>> activePaths = new List<List<TargetNodeInfo>>();
+            foreach (TargetNodeInfo startNode in startingNodes)
+            {
+                if (startNode == null)
+                    continue;
+
+                List<TargetNodeInfo> path = new List<TargetNodeInfo>();
+                path.Add(startNode);
+                activePaths.Add(path);
+            }
+
+            if (activePaths.Count == 0)
+                return completedPaths;
+
+            for (int segmentIndex = 1; segmentIndex < pathSegments.Count; segmentIndex++)
+            {
+                List<List<TargetNodeInfo>> nextPaths = new List<List<TargetNodeInfo>>();
+                string requiredName = pathSegments[segmentIndex];
+
+                foreach (List<TargetNodeInfo> activePath in activePaths)
+                {
+                    TargetNodeInfo parent = activePath[activePath.Count - 1];
+                    List<TargetNodeInfo> segmentMatches = FindNearestDescendantMatches(
+                        parent,
+                        requiredName,
+                        descendantMatchCache,
+                        ref nodesInspected,
+                        ref targetNodesIndexed,
+                        ref targetPathSearchVisits);
+
+                    foreach (TargetNodeInfo match in segmentMatches)
+                    {
+                        List<TargetNodeInfo> nextPath = new List<TargetNodeInfo>(activePath);
+                        nextPath.Add(match);
+                        nextPaths.Add(nextPath);
+
+                        if (nextPaths.Count > MaxPathCandidates)
+                            throw new SearchLimitException();
+                    }
+                }
+
+                activePaths = nextPaths;
+                if (activePaths.Count == 0)
+                    return completedPaths;
+            }
+
+            return activePaths;
+        }
+
+        private static List<TargetNodeInfo> FindNearestDescendantMatches(
+            TargetNodeInfo parent,
+            string requiredName,
+            Dictionary<TargetNodeInfo, Dictionary<string, List<TargetNodeInfo>>> descendantMatchCache,
+            ref int nodesInspected,
+            ref int targetNodesIndexed,
+            ref int targetPathSearchVisits)
+        {
+            List<TargetNodeInfo> noMatches = new List<TargetNodeInfo>();
+            if (parent == null || string.IsNullOrEmpty(requiredName))
+                return noMatches;
+
+            Dictionary<string, List<TargetNodeInfo>> matchesByName;
+            if (descendantMatchCache.TryGetValue(parent, out matchesByName))
+            {
+                List<TargetNodeInfo> cachedMatches;
+                if (matchesByName.TryGetValue(requiredName, out cachedMatches))
+                    return cachedMatches;
+            }
+            else
+            {
+                matchesByName = new Dictionary<string, List<TargetNodeInfo>>(StringComparer.Ordinal);
+                descendantMatchCache.Add(parent, matchesByName);
+            }
+
+            // Stop at the nearest descendant level containing the requested name.
+            // All matches at that level are retained so following path segments can
+            // disambiguate them; duplicate intermediate category names are expected.
+            List<TargetNodeInfo> currentLayer = GetIndexedChildren(
+                parent,
+                ref nodesInspected,
+                ref targetNodesIndexed);
+
+            for (int depth = 1; depth <= MaxIntermediateSearchDepth; depth++)
+            {
+                List<TargetNodeInfo> matches = new List<TargetNodeInfo>();
+                foreach (TargetNodeInfo item in currentLayer)
+                {
+                    targetPathSearchVisits++;
+                    if (targetPathSearchVisits > MaxPathSearchVisits)
+                        throw new SearchLimitException();
+
+                    if (string.Equals(item.DisplayName, requiredName, StringComparison.Ordinal))
+                        matches.Add(item);
+                }
+
+                if (matches.Count > 0)
+                {
+                    matchesByName[requiredName] = matches;
+                    return matches;
+                }
+
+                if (depth == MaxIntermediateSearchDepth)
+                    break;
+
+                List<TargetNodeInfo> nextLayer = new List<TargetNodeInfo>();
+                foreach (TargetNodeInfo item in currentLayer)
+                {
+                    // The target model repeats hierarchy categories under levels, but
+                    // geometry/object branches can be very large. We still inspect a
+                    // node for a name match above; only category nodes are expanded
+                    // further as hierarchy containers. The starting linked-model root
+                    // is always expanded by the initial GetIndexedChildren call.
+                    if (!CanExpandForHierarchySearch(item))
+                        continue;
+
+                    List<TargetNodeInfo> children = GetIndexedChildren(
+                        item,
+                        ref nodesInspected,
+                        ref targetNodesIndexed);
+
+                    foreach (TargetNodeInfo child in children)
+                    {
+                        // Count a path-search visit only when the node is actually
+                        // inspected for a name match in the next iteration. Counting
+                        // both enqueue and inspection double-counted the same node.
+                        nextLayer.Add(child);
+                    }
+                }
+
+                currentLayer = nextLayer;
+                if (currentLayer.Count == 0)
+                    break;
+            }
+
+            matchesByName[requiredName] = noMatches;
+            return noMatches;
+        }
+
+        private static List<List<TargetNodeInfo>> ResolveCandidatePathsByIdentity(
+            ExpectedItem expectedItem,
+            List<List<TargetNodeInfo>> candidatePaths)
+        {
+            if (expectedItem == null || candidatePaths == null || candidatePaths.Count < 2)
+                return candidatePaths ?? new List<List<TargetNodeInfo>>();
+
+            List<IdentityValue> sourceIdentityValues = GetSourceTerminalIdentityValues(expectedItem);
+            if (sourceIdentityValues.Count == 0)
+                return candidatePaths;
+
+            int highestScore = 0;
+            List<List<TargetNodeInfo>> bestPaths = new List<List<TargetNodeInfo>>();
+
+            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+            {
+                if (candidatePath == null || candidatePath.Count == 0)
+                    continue;
+
+                TargetNodeInfo terminalNode = candidatePath[candidatePath.Count - 1];
+                if (terminalNode == null || terminalNode.Item == null)
+                    continue;
+
+                int score = 0;
+                foreach (IdentityValue identityValue in sourceIdentityValues)
+                {
+                    string targetValue = GetModelItemPropertyValue(
+                        terminalNode.Item,
+                        identityValue.CategoryDisplayName,
+                        identityValue.PropertyDisplayName);
+
+                    if (!string.IsNullOrWhiteSpace(targetValue) &&
+                        string.Equals(identityValue.Value, targetValue, StringComparison.OrdinalIgnoreCase))
+                    {
+                        score++;
+                    }
+                }
+
+                if (score > highestScore)
+                {
+                    highestScore = score;
+                    bestPaths.Clear();
+                    bestPaths.Add(candidatePath);
+                }
+                else if (score == highestScore && score > 0)
+                {
+                    bestPaths.Add(candidatePath);
+                }
+            }
+
+            // Only reduce the candidates when identity evidence uniquely identifies
+            // one path. Ties and zero matches remain explicitly ambiguous.
+            if (highestScore > 0 && bestPaths.Count == 1)
+                return bestPaths;
+
+            return candidatePaths;
+        }
+
+        private static List<IdentityValue> GetSourceTerminalIdentityValues(ExpectedItem expectedItem)
+        {
+            List<IdentityValue> result = new List<IdentityValue>();
+            if (expectedItem == null || expectedItem.HierarchyNodes == null ||
+                expectedItem.HierarchyNodes.Count == 0)
+            {
+                return result;
+            }
+
+            Dictionary<string, object> terminalSourceNode =
+                expectedItem.HierarchyNodes[expectedItem.HierarchyNodes.Count - 1];
+            List<object> sourceProperties = AsObjectList(
+                GetDictionaryValue(terminalSourceNode, "properties"));
+
+            foreach (object rawProperty in sourceProperties)
+            {
+                Dictionary<string, object> propertyDictionary = AsDictionary(rawProperty);
+                if (propertyDictionary == null)
+                    continue;
+
+                string propertyDisplayName = GetDictionaryString(propertyDictionary, "propertyDisplayName");
+                if (!IsIdentityProperty(propertyDisplayName))
+                    continue;
+
+                string value = NormalizeDisplayValue(GetDictionaryString(propertyDictionary, "value"));
+                if (!IsUsableIdentityValue(propertyDisplayName, value))
+                    continue;
+
+                IdentityValue identityValue = new IdentityValue();
+                identityValue.CategoryDisplayName = GetDictionaryString(propertyDictionary, "categoryDisplayName");
+                identityValue.PropertyDisplayName = propertyDisplayName;
+                identityValue.Value = value.Trim();
+                result.Add(identityValue);
+            }
+
+            return result;
+        }
+
+        private static bool IsUsableIdentityValue(string propertyDisplayName, string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            string normalizedValue = value.Trim();
+            if (propertyDisplayName.IndexOf("Guid", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                propertyDisplayName.IndexOf("GUID", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                Guid parsedGuid;
+                if (Guid.TryParse(normalizedValue, out parsedGuid) && parsedGuid == Guid.Empty)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsExpectedTerminalCategory(ExpectedItem expectedItem)
+        {
+            string sourceType = GetExpectedTerminalNodeType(expectedItem);
+            return string.Equals(sourceType, "Категория", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(sourceType, "Category", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string GetExpectedTerminalNodeType(ExpectedItem expectedItem)
+        {
+            if (expectedItem == null || expectedItem.HierarchyNodes == null ||
+                expectedItem.HierarchyNodes.Count == 0)
+            {
+                return "";
+            }
+
+            Dictionary<string, object> terminalSourceNode =
+                expectedItem.HierarchyNodes[expectedItem.HierarchyNodes.Count - 1];
+            List<object> sourceProperties = AsObjectList(
+                GetDictionaryValue(terminalSourceNode, "properties"));
+
+            foreach (object rawProperty in sourceProperties)
+            {
+                Dictionary<string, object> propertyDictionary = AsDictionary(rawProperty);
+                if (propertyDictionary == null)
+                    continue;
+
+                string categoryName = GetDictionaryString(propertyDictionary, "categoryDisplayName");
+                string propertyName = GetDictionaryString(propertyDictionary, "propertyDisplayName");
+                if (string.Equals(categoryName, "Элемент", StringComparison.Ordinal) &&
+                    string.Equals(propertyName, "Тип", StringComparison.Ordinal))
+                {
+                    return NormalizeDisplayValue(GetDictionaryString(propertyDictionary, "value"));
+                }
+            }
+
+            return "";
+        }
+
+        private static bool AllCandidatePathsTerminateInCategories(
+            List<List<TargetNodeInfo>> candidatePaths)
+        {
+            if (candidatePaths == null || candidatePaths.Count == 0)
+                return false;
+
+            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+            {
+                if (candidatePath == null || candidatePath.Count == 0)
+                    return false;
+
+                TargetNodeInfo terminalNode = candidatePath[candidatePath.Count - 1];
+                string targetType = GetTargetElementType(terminalNode);
+
+                if (!IsCategoryType(targetType))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static void AddTargetHierarchyPaths(
+            List<List<TargetNodeInfo>> candidatePaths,
+            List<string> targetHierarchyPaths)
+        {
+            if (candidatePaths == null || targetHierarchyPaths == null)
+                return;
+
+            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+            {
+                if (candidatePath == null || candidatePath.Count == 0)
+                    continue;
+
+                TargetNodeInfo terminalNode = candidatePath[candidatePath.Count - 1];
+                targetHierarchyPaths.Add(BuildActualHierarchyPath(terminalNode));
+            }
+        }
+
+        private static bool AllCandidatePathsShareTargetRoot(
+            List<List<TargetNodeInfo>> candidatePaths)
+        {
+            if (candidatePaths == null || candidatePaths.Count == 0)
+                return false;
+
+            TargetNodeInfo expectedRoot = null;
+            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+            {
+                if (candidatePath == null || candidatePath.Count == 0)
+                    return false;
+
+                TargetNodeInfo terminalNode = candidatePath[candidatePath.Count - 1];
+                TargetNodeInfo root = GetIndexedRoot(terminalNode);
+                if (root == null)
+                    return false;
+
+                if (expectedRoot == null)
+                    expectedRoot = root;
+                else if (!object.ReferenceEquals(expectedRoot, root))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static TargetNodeInfo GetIndexedRoot(TargetNodeInfo node)
+        {
+            TargetNodeInfo current = node;
+            while (current != null && current.Parent != null)
+                current = current.Parent;
+            return current;
+        }
+
+        private static bool TryClassifyRepeatedCandidates(
+            ExpectedItem expectedItem,
+            List<List<TargetNodeInfo>> candidatePaths,
+            out string status,
+            out string reasonCode)
+        {
+            status = "AMBIGUOUS";
+            reasonCode = "NO_SAFE_ONE_TO_MANY_RULE_APPLIED";
+
+            if (candidatePaths == null || candidatePaths.Count < 2)
+            {
+                reasonCode = "FEWER_THAN_TWO_CANDIDATES";
+                return false;
+            }
+
+            if (!AllCandidatePathsShareTargetRoot(candidatePaths))
+            {
+                reasonCode = "CANDIDATES_SPAN_MULTIPLE_TARGET_ROOTS";
+                return false;
+            }
+
+            if (!AllCandidatePathsRepeatAcrossLevels(candidatePaths, out reasonCode))
+                return false;
+
+            List<IdentityValue> sourceIdentityValues = GetSourceTerminalIdentityValues(expectedItem);
+            if (sourceIdentityValues.Count > 0)
+            {
+                bool hasGuidIdentity = false;
+                foreach (IdentityValue identityValue in sourceIdentityValues)
+                {
+                    if (identityValue.PropertyDisplayName.IndexOf("GUID", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        hasGuidIdentity = true;
+                        break;
+                    }
+                }
+
+                if (!hasGuidIdentity)
+                {
+                    reasonCode = "SOURCE_HAS_IDENTITY_BUT_NO_GUID_PROPERTY";
+                    return false;
+                }
+
+                if (!AllCandidatesMatchSourceIdentity(candidatePaths, sourceIdentityValues))
+                {
+                    reasonCode = "NOT_ALL_CANDIDATES_MATCH_SOURCE_IDENTITY";
+                    return false;
+                }
+
+                status = "MATCHED_ONE_TO_MANY_IDENTITY";
+                reasonCode = "ALL_CANDIDATES_MATCH_SOURCE_IDENTITY_AND_REPEAT_ACROSS_DISTINCT_LEVELS";
+                return true;
+            }
+
+            // Structural fan-out is only for identity-less Family/container nodes,
+            // not arbitrary geometry or instances. In this source export the node
+            // "Типы трубопроводов" is explicitly typed as "Семейство".
+            string sourceTerminalType = GetExpectedTerminalNodeType(expectedItem);
+            if (!string.Equals(sourceTerminalType, "Семейство", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(sourceTerminalType, "Family", StringComparison.OrdinalIgnoreCase))
+            {
+                reasonCode = "STRUCTURAL_FANOUT_REQUIRES_SOURCE_FAMILY_CONTAINER";
+                return false;
+            }
+
+            // If target properties are unreadable, do not infer that identity is absent.
+            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+            {
+                TargetNodeInfo terminalNode = candidatePath[candidatePath.Count - 1];
+                string targetTerminalType = GetTargetElementType(terminalNode);
+                if (!string.Equals(targetTerminalType, "Семейство", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(targetTerminalType, "Family", StringComparison.OrdinalIgnoreCase))
+                {
+                    reasonCode = "STRUCTURAL_FANOUT_REQUIRES_TARGET_FAMILY_CONTAINER";
+                    return false;
+                }
+
+                if (!TargetHasNoReadableIdentityValues(terminalNode.Item))
+                {
+                    reasonCode = "SOURCE_HAS_NO_IDENTITY_BUT_TARGET_IDENTITY_EXISTS_OR_IS_UNREADABLE";
+                    return false;
+                }
+            }
+
+            status = "MATCHED_ONE_TO_MANY_STRUCTURAL";
+            reasonCode = "IDENTITYLESS_CONTAINERS_SHARE_CANONICAL_PATH_ACROSS_DISTINCT_LEVELS";
+            return true;
+        }
+
+        private static bool AllCandidatesMatchSourceIdentity(
+            List<List<TargetNodeInfo>> candidatePaths,
+            List<IdentityValue> sourceIdentityValues)
+        {
+            if (candidatePaths == null || candidatePaths.Count < 2 ||
+                sourceIdentityValues == null || sourceIdentityValues.Count == 0)
+            {
+                return false;
+            }
+
+            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+            {
+                if (candidatePath == null || candidatePath.Count == 0)
+                    return false;
+
+                TargetNodeInfo terminalNode = candidatePath[candidatePath.Count - 1];
+                if (terminalNode == null || terminalNode.Item == null)
+                    return false;
+
+                foreach (IdentityValue identityValue in sourceIdentityValues)
+                {
+                    string targetValue = GetModelItemPropertyValue(
+                        terminalNode.Item,
+                        identityValue.CategoryDisplayName,
+                        identityValue.PropertyDisplayName);
+
+                    if (string.IsNullOrWhiteSpace(targetValue) ||
+                        !string.Equals(
+                            NormalizeDisplayValue(identityValue.Value),
+                            NormalizeDisplayValue(targetValue),
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private static bool AllCandidatePathsRepeatAcrossLevels(
+            List<List<TargetNodeInfo>> candidatePaths,
+            out string reasonCode)
+        {
+            reasonCode = "CANDIDATES_DO_NOT_REPEAT_ACROSS_LEVELS";
+            if (candidatePaths == null || candidatePaths.Count < 2)
+                return false;
+
+            string expectedCanonicalPath = null;
+            HashSet<TargetNodeInfo> seenLevels = new HashSet<TargetNodeInfo>();
+
+            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+            {
+                if (candidatePath == null || candidatePath.Count == 0)
+                {
+                    reasonCode = "EMPTY_CANDIDATE_PATH";
+                    return false;
+                }
+
+                TargetNodeInfo terminalNode = candidatePath[candidatePath.Count - 1];
+                TargetNodeInfo levelNode = GetNearestLevelAncestor(terminalNode);
+                if (levelNode == null)
+                {
+                    reasonCode = "CANDIDATE_WITHOUT_LCREVITLAYER_ANCESTOR";
+                    return false;
+                }
+
+                if (!seenLevels.Add(levelNode))
+                {
+                    reasonCode = "MULTIPLE_CANDIDATES_OCCUR_UNDER_THE_SAME_LEVEL";
+                    return false;
+                }
+
+                string canonicalPath = BuildCanonicalPathIgnoringLevels(terminalNode);
+                if (string.IsNullOrWhiteSpace(canonicalPath))
+                {
+                    reasonCode = "CANONICAL_TARGET_PATH_IS_EMPTY";
+                    return false;
+                }
+
+                if (expectedCanonicalPath == null)
+                    expectedCanonicalPath = canonicalPath;
+                else if (!string.Equals(
+                    expectedCanonicalPath,
+                    canonicalPath,
+                    StringComparison.Ordinal))
+                {
+                    reasonCode = "CANDIDATE_PATHS_DIFFER_AFTER_LEVELS_ARE_EXCLUDED";
+                    return false;
+                }
+            }
+
+            reasonCode = "REPEATED_ACROSS_DISTINCT_LEVELS_WITH_IDENTICAL_CANONICAL_PATH";
+            return true;
+        }
+
+        private static TargetNodeInfo GetNearestLevelAncestor(TargetNodeInfo node)
+        {
+            TargetNodeInfo current = node == null ? null : node.Parent;
+            while (current != null)
+            {
+                if (IsLevelNode(current))
+                    return current;
+                current = current.Parent;
+            }
+
+            return null;
+        }
+
+        private static bool IsLevelNode(TargetNodeInfo node)
+        {
+            if (node == null || node.Item == null)
+                return false;
+
+            return string.Equals(
+                SafeModelItemClassName(node.Item),
+                "LcRevitLayer",
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildCanonicalPathIgnoringLevels(TargetNodeInfo node)
+        {
+            List<string> reversedNames = new List<string>();
+            TargetNodeInfo current = node;
+            while (current != null)
+            {
+                if (!IsLevelNode(current) && !string.IsNullOrWhiteSpace(current.DisplayName))
+                    reversedNames.Add(current.DisplayName);
+                current = current.Parent;
+            }
+
+            StringBuilder builder = new StringBuilder();
+            for (int index = reversedNames.Count - 1; index >= 0; index--)
+            {
+                if (builder.Length > 0)
+                    builder.Append(" / ");
+                builder.Append(reversedNames[index]);
+            }
+
+            return builder.ToString();
+        }
+
+        private static bool TargetHasNoReadableIdentityValues(ModelItem modelItem)
+        {
+            if (modelItem == null)
+                return false;
+
+            try
+            {
+                foreach (PropertyCategory category in modelItem.PropertyCategories)
+                {
+                    foreach (DataProperty property in category.Properties)
+                    {
+                        if (!IsIdentityProperty(property.DisplayName))
+                            continue;
+
+                        if (!string.IsNullOrWhiteSpace(GetPropertyValueText(property)))
+                            return false;
+                    }
+                }
+            }
+            catch
+            {
+                // Property access failures are not evidence that an identity is absent.
+                return false;
+            }
+
+            return true;
+        }
+
+        private static List<object> BuildSourceIdentityValueReports(ExpectedItem expectedItem)
+        {
+            List<object> reports = new List<object>();
+            foreach (IdentityValue identityValue in GetSourceTerminalIdentityValues(expectedItem))
+            {
+                Dictionary<string, object> report = new Dictionary<string, object>();
+                report["categoryDisplayName"] = identityValue.CategoryDisplayName;
+                report["propertyDisplayName"] = identityValue.PropertyDisplayName;
+                report["value"] = identityValue.Value;
+                reports.Add(report);
+            }
+            return reports;
+        }
+
+        private static bool CanExpandForHierarchySearch(TargetNodeInfo node)
+        {
+            if (node == null || node.Item == null)
+                return false;
+
+            // Depth zero represents the linked-model root located by name. Always
+            // expand it to expose the first hierarchy layer.
+            if (node.Depth == 0)
+                return true;
+
+            // IMPORTANT: ModelItem's class and the Revit "Element -> Type"
+            // property are different concepts. For a Revit level, ClassName is
+            // "LcRevitLayer", while Element -> Type may contain a type name such
+            // as "Уровни: Уровень: ...". Do not detect a structural layer by that
+            // Revit property; use the Navisworks ModelItem class instead.
+            try
+            {
+                if (string.Equals(
+                    node.Item.ClassName,
+                    "LcRevitLayer",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                // If ClassName is unavailable, continue with the category test below.
+            }
+
+            // Category nodes still use the exported Element -> Type property, which
+            // was verified in the debugger to return "Категория" for these nodes.
+            return IsCategoryType(GetTargetElementType(node));
+        }
+
+        private static string GetTargetElementType(TargetNodeInfo node)
+        {
+            if (node == null || node.Item == null)
+                return "";
+
+            if (!node.ElementTypeLoaded)
+            {
+                node.ElementType = GetModelItemPropertyValue(node.Item, "Элемент", "Тип");
+                node.ElementTypeLoaded = true;
+            }
+
+            return node.ElementType ?? "";
+        }
+
+        private static bool IsCategoryType(string value)
+        {
+            return string.Equals(value, "Категория", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "Category", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static List<TargetNodeInfo> GetIndexedChildren(
+            TargetNodeInfo parent,
+            ref int nodesInspected,
+            ref int targetNodesIndexed)
+        {
+            if (parent == null)
+                return new List<TargetNodeInfo>();
+
+            if (parent.ChildrenLoaded)
+                return parent.Children;
+
+            List<TargetNodeInfo> loadedChildren = new List<TargetNodeInfo>();
+            foreach (ModelItem childItem in parent.Item.Children)
+            {
+                CountInspectedNode(ref nodesInspected);
+
+                TargetNodeInfo child = new TargetNodeInfo();
+                child.Item = childItem;
+                child.DisplayName = SafeDisplayName(childItem);
+                child.Parent = parent;
+                child.Depth = parent.Depth + 1;
+                child.ChildrenLoaded = false;
+                loadedChildren.Add(child);
+            }
+
+            parent.Children.AddRange(loadedChildren);
+            parent.ChildrenLoaded = true;
+            targetNodesIndexed += loadedChildren.Count;
+            return parent.Children;
+        }
+
+        private static List<ModelItem> ConvertToModelItems(List<TargetNodeInfo> targetPathNodes)
+        {
+            List<ModelItem> result = new List<ModelItem>();
+            if (targetPathNodes == null)
+                return result;
+
+            foreach (TargetNodeInfo node in targetPathNodes)
+            {
+                if (node != null && node.Item != null)
+                    result.Add(node.Item);
+            }
+
+            return result;
+        }
+
+        private static List<object> BuildCandidatePathReports(
+            List<List<TargetNodeInfo>> candidatePaths)
+        {
+            List<object> reports = new List<object>();
+            if (candidatePaths == null)
+                return reports;
+
+            int itemCount = Math.Min(candidatePaths.Count, MaxCandidatePathsInReport);
+            for (int index = 0; index < itemCount; index++)
+            {
+                List<TargetNodeInfo> candidatePath = candidatePaths[index];
+                if (candidatePath == null || candidatePath.Count == 0)
+                    continue;
+
+                TargetNodeInfo finalNode = candidatePath[candidatePath.Count - 1];
+                Dictionary<string, object> candidateReport = new Dictionary<string, object>();
+                candidateReport["matchedPath"] = BuildDisplayPath(ConvertToModelItems(candidatePath));
+                candidateReport["targetHierarchyPath"] = BuildActualHierarchyPath(finalNode);
+                candidateReport["identityProperties"] = GetIdentityPropertySummaries(finalNode.Item);
+                reports.Add(candidateReport);
+            }
+
+            return reports;
+        }
+
+        private static List<object> GetIdentityPropertySummaries(ModelItem modelItem)
+        {
+            List<object> summaries = new List<object>();
+            if (modelItem == null)
+                return summaries;
+
+            try
+            {
+                foreach (PropertyCategory category in modelItem.PropertyCategories)
+                {
+                    foreach (DataProperty property in category.Properties)
+                    {
+                        if (!IsIdentityProperty(property.DisplayName))
+                            continue;
+
+                        string value = GetPropertyValueText(property);
+                        if (string.IsNullOrWhiteSpace(value))
+                            continue;
+
+                        Dictionary<string, object> summary = new Dictionary<string, object>();
+                        summary["categoryDisplayName"] = category.DisplayName ?? "";
+                        summary["propertyDisplayName"] = property.DisplayName ?? "";
+                        summary["value"] = value;
+                        summaries.Add(summary);
+                    }
+                }
+            }
+            catch
+            {
+                // Candidate paths remain useful even if properties cannot be read.
+            }
+
+            return summaries;
+        }
+
+        private static string BuildActualHierarchyPath(TargetNodeInfo node)
+        {
+            List<string> reversedNames = new List<string>();
+            TargetNodeInfo current = node;
+            while (current != null)
+            {
+                if (!string.IsNullOrEmpty(current.DisplayName))
+                    reversedNames.Add(current.DisplayName);
+                current = current.Parent;
+            }
+
+            StringBuilder builder = new StringBuilder();
+            for (int index = reversedNames.Count - 1; index >= 0; index--)
+            {
+                if (builder.Length > 0)
+                    builder.Append(" / ");
+                builder.Append(reversedNames[index]);
+            }
+
+            return builder.ToString();
+        }
+
+        private static List<ModelItem> GetChildrenSafely(
+            ModelItem parent,
+            ref int nodesInspected)
+        {
+            List<ModelItem> children = new List<ModelItem>();
+            if (parent == null)
+                return children;
+
+            try
+            {
+                foreach (ModelItem child in parent.Children)
+                {
+                    CountInspectedNode(ref nodesInspected);
+                    children.Add(child);
+                }
+            }
+            catch (SearchLimitException)
+            {
+                throw;
+            }
+
+            return children;
+        }
+
+        private static void CountInspectedNode(ref int nodesInspected)
+        {
+            nodesInspected++;
+            if (nodesInspected > MaxNodesInspected)
+                throw new SearchLimitException();
+        }
+
+        private static string ReadSourceJson(out string selectedFilePath)
+        {
+            selectedFilePath = null;
+            using (OpenFileDialog dialog = new OpenFileDialog())
+            {
+                dialog.Title = "Выберите JSON, экспортированный из исходного NWF";
+                dialog.Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
+                dialog.Multiselect = false;
+                dialog.InitialDirectory = Environment.GetFolderPath(
+                    Environment.SpecialFolder.Desktop);
+
+                if (dialog.ShowDialog() != DialogResult.OK)
+                    return null;
+
+                selectedFilePath = dialog.FileName;
+                return File.ReadAllText(dialog.FileName, Encoding.UTF8);
+            }
+        }
+
+        private static List<ExpectedSet> ReadExpectedSets(
+            Dictionary<string, object> sourceDocument)
+        {
+            List<ExpectedSet> result = new List<ExpectedSet>();
+            List<object> rawSets = AsObjectList(GetDictionaryValue(sourceDocument, "selectionSets"));
+
+            foreach (object rawSet in rawSets)
+            {
+                Dictionary<string, object> setDictionary = AsDictionary(rawSet);
+                if (setDictionary == null)
+                    continue;
+
+                ExpectedSet expectedSet = new ExpectedSet();
+                expectedSet.Name = GetDictionaryString(setDictionary, "name");
+
+                List<object> rawItems = AsObjectList(GetDictionaryValue(setDictionary, "items"));
+                foreach (object rawItem in rawItems)
+                {
+                    Dictionary<string, object> itemDictionary = AsDictionary(rawItem);
+                    if (itemDictionary == null)
+                        continue;
+
+                    ExpectedItem expectedItem = new ExpectedItem();
+                    expectedItem.DisplayName = GetDictionaryString(itemDictionary, "displayName");
+                    expectedItem.SourceHierarchyPath = GetDictionaryString(itemDictionary, "hierarchyPath");
+                    expectedItem.HierarchyNodes = new List<Dictionary<string, object>>();
+
+                    List<object> rawHierarchy = AsObjectList(GetDictionaryValue(itemDictionary, "hierarchy"));
+                    foreach (object rawNode in rawHierarchy)
+                    {
+                        Dictionary<string, object> nodeDictionary = AsDictionary(rawNode);
+                        if (nodeDictionary != null)
+                            expectedItem.HierarchyNodes.Add(nodeDictionary);
+                    }
+
+                    if (string.IsNullOrEmpty(expectedItem.DisplayName) && expectedItem.HierarchyNodes.Count > 0)
+                    {
+                        expectedItem.DisplayName = GetDictionaryString(
+                            expectedItem.HierarchyNodes[expectedItem.HierarchyNodes.Count - 1],
+                            "displayName");
+                    }
+
+                    expectedSet.Items.Add(expectedItem);
+                }
+
+                result.Add(expectedSet);
+            }
+
+            return result;
+        }
+
+        private static List<string> GetSourcePathSegments(
+            List<Dictionary<string, object>> hierarchyNodes)
+        {
+            List<string> segments = new List<string>();
+            if (hierarchyNodes == null || hierarchyNodes.Count < 2)
+                return segments;
+
+            // Ignore the top-level NWC file name; target container names may differ.
+            for (int index = 1; index < hierarchyNodes.Count; index++)
+            {
+                string name = GetDictionaryString(hierarchyNodes[index], "displayName");
+                if (string.IsNullOrEmpty(name))
+                    return new List<string>();
+
+                segments.Add(name);
+            }
+
+            return segments;
+        }
+
+        private static List<string> CompareIdentityProperties(
+            ExpectedItem expectedItem,
+            List<ModelItem> targetPathNodes)
+        {
+            List<string> warnings = new List<string>();
+            if (expectedItem.HierarchyNodes == null || targetPathNodes == null)
+                return warnings;
+
+            int sourceIndex = 1;
+            int targetIndex = 0;
+            while (sourceIndex < expectedItem.HierarchyNodes.Count && targetIndex < targetPathNodes.Count)
+            {
+                Dictionary<string, object> sourceNode = expectedItem.HierarchyNodes[sourceIndex];
+                ModelItem targetNode = targetPathNodes[targetIndex];
+                string nodeName = GetDictionaryString(sourceNode, "displayName");
+                List<object> sourceProperties = AsObjectList(
+                    GetDictionaryValue(sourceNode, "properties"));
+
+                foreach (object rawProperty in sourceProperties)
+                {
+                    Dictionary<string, object> propertyDictionary = AsDictionary(rawProperty);
+                    if (propertyDictionary == null)
+                        continue;
+
+                    string propertyDisplayName = GetDictionaryString(propertyDictionary, "propertyDisplayName");
+                    if (!IsIdentityProperty(propertyDisplayName))
+                        continue;
+
+                    string sourceValue = NormalizeDisplayValue(GetDictionaryString(propertyDictionary, "value"));
+                    if (string.IsNullOrWhiteSpace(sourceValue))
+                        continue;
+
+                    string categoryDisplayName = GetDictionaryString(propertyDictionary, "categoryDisplayName");
+                    string targetValue = GetModelItemPropertyValue(
+                        targetNode,
+                        categoryDisplayName,
+                        propertyDisplayName);
+
+                    if (string.IsNullOrWhiteSpace(targetValue))
+                    {
+                        warnings.Add(
+                            nodeName + ": в целевом узле не найдено свойство '" +
+                            propertyDisplayName + "', присутствовавшее в исходном экспорте.");
+                    }
+                    else if (!string.Equals(sourceValue, targetValue, StringComparison.Ordinal))
+                    {
+                        warnings.Add(
+                            nodeName + ": свойство '" + propertyDisplayName +
+                            "' изменилось (исходное='" + sourceValue +
+                            "', целевое='" + targetValue + "').");
+                    }
+                }
+
+                sourceIndex++;
+                targetIndex++;
+            }
+
+            return warnings;
+        }
+
+        private static bool IsIdentityProperty(string propertyDisplayName)
+        {
+            return string.Equals(propertyDisplayName, "IfcGUID", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(propertyDisplayName, "Тип IfcGUID", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(propertyDisplayName, "Id", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string GetModelItemPropertyValue(
+            ModelItem modelItem,
+            string categoryDisplayName,
+            string propertyDisplayName)
+        {
+            try
+            {
+                if (modelItem == null)
+                    return "";
+
+                foreach (PropertyCategory category in modelItem.PropertyCategories)
+                {
+                    if (!string.Equals(
+                        category.DisplayName ?? "",
+                        categoryDisplayName ?? "",
+                        StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    foreach (DataProperty property in category.Properties)
+                    {
+                        if (string.Equals(
+                            property.DisplayName ?? "",
+                            propertyDisplayName ?? "",
+                            StringComparison.Ordinal))
+                        {
+                            return GetPropertyValueText(property);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // A missing/unavailable property is reported as an identity warning.
+            }
+
+            return "";
+        }
+
+        private static string GetPropertyValueText(DataProperty property)
+        {
+            try
+            {
+                return NormalizeDisplayValue(property.Value.ToDisplayString());
+            }
+            catch
+            {
+                try
+                {
+                    return NormalizeDisplayValue(property.Value.ToString());
+                }
+                catch
+                {
+                    return "";
+                }
+            }
+        }
+
+        private static string NormalizeDisplayValue(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+
+            const string displayStringPrefix = "DisplayString:";
+            string normalized = value.Trim();
+            if (normalized.StartsWith(displayStringPrefix, StringComparison.OrdinalIgnoreCase))
+                normalized = normalized.Substring(displayStringPrefix.Length).Trim();
+
+            return normalized;
+        }
+
+        private static string BuildDisplayPath(List<ModelItem> pathNodes)
+        {
+            StringBuilder builder = new StringBuilder();
+            for (int index = 0; index < pathNodes.Count; index++)
+            {
+                if (index > 0)
+                    builder.Append(" / ");
+
+                builder.Append(SafeDisplayName(pathNodes[index]));
+            }
+
+            return builder.ToString();
+        }
+
+        private static string SafeDisplayName(ModelItem modelItem)
+        {
+            if (modelItem == null)
+                return "";
+
+            try
+            {
+                return modelItem.DisplayName ?? "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static int CountExpectedItems(List<ExpectedSet> sets)
+        {
+            int count = 0;
+            foreach (ExpectedSet set in sets)
+                count += set.Items.Count;
+            return count;
+        }
+
+        private static Dictionary<string, object> AsDictionary(object value)
+        {
+            return value as Dictionary<string, object>;
+        }
+
+        private static List<object> AsObjectList(object value)
+        {
+            List<object> result = new List<object>();
+            IEnumerable enumerable = value as IEnumerable;
+
+            if (enumerable == null || value is string || value is IDictionary)
+                return result;
+
+            foreach (object item in enumerable)
+                result.Add(item);
+
+            return result;
+        }
+
+        private static object GetDictionaryValue(Dictionary<string, object> dictionary, string key)
+        {
+            if (dictionary == null || string.IsNullOrEmpty(key))
+                return null;
+
+            object value;
+            return dictionary.TryGetValue(key, out value) ? value : null;
+        }
+
+        private static string GetDictionaryString(Dictionary<string, object> dictionary, string key)
+        {
+            object value = GetDictionaryValue(dictionary, key);
+            return value == null ? "" : Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+        }
+
+        private static void ShowSummary(
+            string reportPath,
+            string sourceTitle,
+            string targetTitle,
+            int setCount,
+            int expectedCount,
+            int matchedCount,
+            int oneToManyCategoryCount,
+            int oneToManyIdentityCount,
+            int oneToManyStructuralCount,
+            int identityDisambiguatedCount,
+            int missingCount,
+            int ambiguousCount,
+            int searchLimitCount,
+            int identityWarningCount,
+            int nodesInspected,
+            int targetNodesIndexed,
+            int targetPathSearchVisits,
+            bool searchLimitReached,
+            bool transferRequested,
+            bool transferApplied,
+            string transferStatus,
+            int createdSelectionSetCount,
+            int createdTargetModelItemCount,
+            string transferError)
+        {
+            StringBuilder message = new StringBuilder();
+            message.AppendLine(transferRequested
+                ? "Обработка переноса завершена."
+                : "Проверка завершена. Документ не изменялся.");
+            message.AppendLine();
+            message.AppendLine("Исходный документ в JSON: " + sourceTitle);
+            message.AppendLine("Текущий целевой документ: " + targetTitle);
+            message.AppendLine();
+            message.AppendLine("Наборов проверено: " + setCount);
+            message.AppendLine("Исходных узлов: " + expectedCount);
+            message.AppendLine("Однозначно сопоставлено: " + matchedCount);
+            message.AppendLine("Категорий сопоставлено один-ко-многим: " + oneToManyCategoryCount);
+            message.AppendLine("Узлов сопоставлено один-ко-многим по ID/GUID: " + oneToManyIdentityCount);
+            message.AppendLine("Контейнеров сопоставлено один-ко-многим по структуре: " + oneToManyStructuralCount);
+            message.AppendLine("Неоднозначность снята выбором одного пути по ID/GUID: " + identityDisambiguatedCount);
+            message.AppendLine("Не найдено: " + missingCount);
+            message.AppendLine("Неоднозначных соответствий: " + ambiguousCount);
+            message.AppendLine("Поиск не завершён для узлов: " + searchLimitCount);
+            message.AppendLine("Предупреждений по ID/GUID: " + identityWarningCount);
+            message.AppendLine("Узлов просмотрено при поиске и индексации: " + nodesInspected);
+            message.AppendLine("Узлов целевого дерева проиндексировано: " + targetNodesIndexed);
+            message.AppendLine("Проверок узлов при сопоставлении путей: " + targetPathSearchVisits);
+            message.AppendLine("Лимит безопасного поиска достигнут: " + (searchLimitReached ? "да" : "нет"));
+            message.AppendLine();
+            message.AppendLine("Отчёт сохранён:");
+            message.AppendLine(reportPath);
+            message.AppendLine();
+            if (!transferRequested)
+            {
+                message.AppendLine("Selection Sets не создавались и не изменялись.");
+            }
+            else if (transferApplied)
+            {
+                message.AppendLine("Создано Selection Sets: " + createdSelectionSetCount);
+                message.AppendLine("Всего целевых ModelItem во всех наборах: " + createdTargetModelItemCount);
+                message.AppendLine("Статус переноса: " + transferStatus);
+                message.AppendLine("Документ изменён в памяти. Сохраните рабочую копию NWF вручную, если результат проверен.");
+            }
+            else
+            {
+                message.AppendLine("Перенос не завершён успешно.");
+                message.AppendLine("Статус переноса: " + transferStatus);
+                if (string.Equals(transferStatus, "FAILED_ROLLBACK_INCOMPLETE", StringComparison.Ordinal))
+                {
+                    message.AppendLine("ВНИМАНИЕ: часть добавленных наборов могла остаться в документе.");
+                    message.AppendLine("Не сохраняйте NWF. Проверьте дерево Sets и при необходимости закройте копию без сохранения.");
+                    message.AppendLine("Наборов, всё ещё обнаруженных в документе по результату проверки: " + createdSelectionSetCount);
+                }
+                else
+                {
+                    message.AppendLine("Selection Sets не были перенесены.");
+                }
+                if (!string.IsNullOrWhiteSpace(transferError))
+                {
+                    message.AppendLine("Причина:");
+                    message.AppendLine(transferError);
+                }
+            }
+
+            if (sourceTitle.IndexOf("_П3_", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                targetTitle.IndexOf("_П3_", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                message.AppendLine();
+                message.AppendLine("ВНИМАНИЕ: JSON относится к П3, а название текущего NWF не содержит '_П3_'. Проверьте, что открыт целевой документ того же проекта/этажа.");
+            }
+
+            MessageBox.Show(
+                message.ToString(),
+                "Navis Coordinator — результат проверки",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        private static string PrettyPrintJson(string json)
+        {
+            StringBuilder builder = new StringBuilder();
+            int indentation = 0;
+            bool insideString = false;
+            bool escaped = false;
+
+            for (int index = 0; index < json.Length; index++)
+            {
+                char current = json[index];
+
+                if (insideString)
+                {
+                    builder.Append(current);
+                    if (escaped)
+                        escaped = false;
+                    else if (current == '\\')
+                        escaped = true;
+                    else if (current == '"')
+                        insideString = false;
+                    continue;
+                }
+
+                if (char.IsWhiteSpace(current))
+                    continue;
+
+                if (current == '"')
+                {
+                    insideString = true;
+                    builder.Append(current);
+                    continue;
+                }
+
+                if (current == '{' || current == '[')
+                {
+                    builder.Append(current);
+                    int nextNonWhitespace = FindNextNonWhitespace(json, index + 1);
+                    char matchingClose = current == '{' ? '}' : ']';
+                    if (nextNonWhitespace < json.Length && json[nextNonWhitespace] == matchingClose)
+                    {
+                        builder.Append(matchingClose);
+                        index = nextNonWhitespace;
+                    }
+                    else
+                    {
+                        indentation++;
+                        builder.AppendLine();
+                        AppendIndentation(builder, indentation);
+                    }
+                    continue;
+                }
+
+                if (current == '}' || current == ']')
+                {
+                    builder.AppendLine();
+                    indentation--;
+                    if (indentation < 0)
+                        indentation = 0;
+                    AppendIndentation(builder, indentation);
+                    builder.Append(current);
+                    continue;
+                }
+
+                if (current == ',')
+                {
+                    builder.Append(current);
+                    builder.AppendLine();
+                    AppendIndentation(builder, indentation);
+                    continue;
+                }
+
+                if (current == ':')
+                {
+                    builder.Append(": ");
+                    continue;
+                }
+
+                builder.Append(current);
+            }
+
+            return builder.ToString();
+        }
+
+        private static int FindNextNonWhitespace(string text, int startIndex)
+        {
+            for (int index = startIndex; index < text.Length; index++)
+            {
+                if (!char.IsWhiteSpace(text[index]))
+                    return index;
+            }
+
+            return text.Length;
+        }
+
+        private static void AppendIndentation(StringBuilder builder, int indentation)
+        {
+            for (int index = 0; index < indentation; index++)
+                builder.Append("  ");
+        }
+
+        private sealed class TargetNodeInfo
+        {
+            public ModelItem Item;
+            public string DisplayName = "";
+            public TargetNodeInfo Parent;
+            public int Depth;
+            public string ElementType = "";
+            public bool ElementTypeLoaded;
+            public bool ChildrenLoaded;
+            public List<TargetNodeInfo> Children = new List<TargetNodeInfo>();
+        }
+
+        private sealed class ExpectedSet
+        {
+            public string Name = "";
+            public List<ExpectedItem> Items = new List<ExpectedItem>();
+        }
+
+        private sealed class ExpectedItem
+        {
+            public string DisplayName = "";
+            public string SourceHierarchyPath = "";
+            public List<Dictionary<string, object>> HierarchyNodes =
+                new List<Dictionary<string, object>>();
+        }
+
+        private sealed class IdentityValue
+        {
+            public string CategoryDisplayName = "";
+            public string PropertyDisplayName = "";
+            public string Value = "";
+        }
+
+        private sealed class SearchLimitException : Exception
+        {
+        }
+    }
+}
