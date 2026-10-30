@@ -29,18 +29,27 @@ namespace NavisCoordinator.Services
 
         public static void RunDryRun()
         {
-            RunMatchingWorkflow(false);
+            RunMatchingWorkflow(false, false);
         }
 
-        // Creates Selection Sets only after a complete successful preflight and
-        // an explicit user confirmation. It never overwrites existing sets and
-        // never saves the NWF automatically.
+        // Legacy transfer from an exported Selection Sets JSON. Existing sets are never overwritten.
         public static void RunTransfer()
         {
-            RunMatchingWorkflow(true);
+            RunMatchingWorkflow(true, false);
         }
 
-        private static void RunMatchingWorkflow(bool applyTransfer)
+        // Native rebuild uses an explicit section policy rather than empty/obsolete source selections.
+        public static void RunNativeRebuildDryRun()
+        {
+            RunMatchingWorkflow(false, true);
+        }
+
+        public static void RunNativeRebuildTransfer()
+        {
+            RunMatchingWorkflow(true, true);
+        }
+
+        private static void RunMatchingWorkflow(bool applyTransfer, bool nativeRebuild)
         {
             try
             {
@@ -55,7 +64,7 @@ namespace NavisCoordinator.Services
                     return;
                 }
 
-                if (!applyTransfer)
+                if (!applyTransfer && !nativeRebuild)
                 {
                     // Temporary diagnostic mode. This uses the existing plugin command,
                     // so no menu/XAML wiring is required. Choose Yes to export the loaded
@@ -81,7 +90,9 @@ namespace NavisCoordinator.Services
                 }
 
                 string sourceJsonPath;
-                string sourceJson = ReadSourceJson(out sourceJsonPath);
+                string sourceJson = nativeRebuild
+                    ? ReadNativePolicyJson(out sourceJsonPath)
+                    : ReadSourceJson(out sourceJsonPath);
                 if (string.IsNullOrEmpty(sourceJson))
                     return;
 
@@ -101,7 +112,33 @@ namespace NavisCoordinator.Services
                     return;
                 }
 
-                List<ExpectedSet> expectedSets = ReadExpectedSets(sourceDocument);
+                Dictionary<string, object> selectedPolicyTarget = nativeRebuild
+                    ? AsDictionary(GetDictionaryValue(sourceDocument, "target"))
+                    : null;
+                bool universalNativeRebuild = nativeRebuild &&
+                    GetDictionaryBoolean(selectedPolicyTarget, "autoDiscoverLinkedRoots", false);
+
+                List<ExpectedSet> expectedSets;
+                try
+                {
+                    expectedSets = nativeRebuild
+                        ? (universalNativeRebuild
+                            ? ReadUniversalNativeRebuildPolicyExpectedSets(sourceDocument, document, document.Title ?? "")
+                            : ReadNativeRebuildPolicyExpectedSets(sourceDocument, document.Title ?? ""))
+                        : ReadExpectedSets(sourceDocument);
+                }
+                catch (Exception policyException)
+                {
+                    MessageBox.Show(
+                        "Не удалось прочитать политику нативного построения Selection Sets:\n\n" +
+                        policyException.Message +
+                        "\n\nДокумент не изменён.",
+                        "Navis Coordinator — ошибка политики",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return;
+                }
+
                 int sourceSelectionSetCount = expectedSets.Count;
                 int sourceExpectedItemCount = CountExpectedItems(expectedSets);
                 int expectedItemCount = sourceExpectedItemCount;
@@ -110,8 +147,9 @@ namespace NavisCoordinator.Services
                 if (expectedSets.Count == 0 || expectedItemCount == 0)
                 {
                     MessageBox.Show(
-                        "В JSON не найдены Selection Sets или выбранные узлы.\n" +
-                        "Проверьте, что это файл экспорта формата 2.",
+                        nativeRebuild
+                            ? "В политике не найдены разделы или элементы для построения Selection Sets.\nПроверьте выбранный файл профиля разделов."
+                            : "В JSON не найдены Selection Sets или выбранные узлы.\nПроверьте, что это файл экспорта формата 2.",
                         "Navis Coordinator",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
@@ -126,6 +164,22 @@ namespace NavisCoordinator.Services
                 try
                 {
                     rootOverrides = LoadRootOverrides(rootOverridesPath, serializer);
+                    if (nativeRebuild)
+                    {
+                        string nativePolicyMappingError = ValidateNativePolicyRootOverrides(
+                            sourceDocument,
+                            rootOverrides,
+                            rootOverridesConfigExists);
+                        if (!string.IsNullOrWhiteSpace(nativePolicyMappingError))
+                        {
+                            MessageBox.Show(
+                                nativePolicyMappingError + "\n\nДокумент не изменён.",
+                                "Navis Coordinator — проверка rootOverrides",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Error);
+                            return;
+                        }
+                    }
                 }
                 catch (Exception configException)
                 {
@@ -146,6 +200,7 @@ namespace NavisCoordinator.Services
                 int oneToManyCategoryMatches = 0;
                 int oneToManyIdentityMatches = 0;
                 int oneToManyStructuralMatches = 0;
+                int oneToManyNativePolicyMatches = 0;
                 int identityDisambiguatedMatches = 0;
                 int missingItems = 0;
                 int ambiguousItems = 0;
@@ -242,6 +297,33 @@ namespace NavisCoordinator.Services
                     }
                 }
 
+                // Native rule-based sections are expanded from the ACTUAL target tree only
+                // after every required linked-model root has been located. This keeps the
+                // policy stable across P1/P2/P3 while allowing level-specific categories and
+                // pipe types to vary naturally between stages.
+                List<object> nativeRuleExpansionReports = new List<object>();
+                int nativeRuleBasedSetCount = 0;
+                if (nativeRebuild)
+                {
+                    nativeRuleBasedSetCount = CountNativePolicySetsByMode(expectedSets, "ruleBased");
+                    bool nativeRuleSearchLimitReached;
+                    nativeRuleExpansionReports = ExpandNativeRuleBasedSets(
+                        expectedSets,
+                        indexedRootsByName,
+                        document.Title ?? "",
+                        ref nodesInspected,
+                        out nativeRuleSearchLimitReached);
+
+                    if (nativeRuleSearchLimitReached)
+                        searchLimitReached = true;
+
+                    // A rule-based section initially contains only a linked-root placeholder
+                    // for root mapping. Replace that placeholder with the actual policy items
+                    // found in the target tree before computing expected counts or matching.
+                    sourceExpectedItemCount = CountExpectedItems(expectedSets);
+                    expectedItemCount = sourceExpectedItemCount;
+                }
+
                 // Additional target links may appear after a model split (for example,
                 // the former АСКУЭР link became АСКУЭ and АСКУВТ). They are not source
                 // Selection Sets, so create whole-link sets for target roots that remain
@@ -267,12 +349,15 @@ namespace NavisCoordinator.Services
 
                 List<ModelItem> allTargetLinkedRoots = new List<ModelItem>();
                 string targetDocumentTitle = document.Title ?? "";
-                string targetProjectPrefix;
-                string targetStageToken;
-                bool targetProjectStageKnown = TryGetProjectAndStageToken(
+                string targetProjectPrefix = "";
+                string targetStageToken = "";
+                bool targetProjectStageKnown = universalNativeRebuild || TryGetProjectAndStageToken(
                     targetDocumentTitle,
                     out targetProjectPrefix,
                     out targetStageToken);
+                string universalProjectPrefix = universalNativeRebuild
+                    ? GetDictionaryString(sourceDocument, "universalProjectPrefix")
+                    : "";
 
                 if (allSourceRootsMappedUniquely && targetProjectStageKnown)
                 {
@@ -291,118 +376,168 @@ namespace NavisCoordinator.Services
                         rootMappingReports.Add(blockingReport);
                     }
 
-                    HashSet<string> usedSyntheticSetNames =
-                        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (ExpectedSet existingSet in expectedSets)
+                    if (!nativeRebuild)
                     {
-                        if (existingSet != null && !string.IsNullOrWhiteSpace(existingSet.Name))
-                            usedSyntheticSetNames.Add(existingSet.Name);
+                        HashSet<string> usedSyntheticSetNames =
+                            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (ExpectedSet existingSet in expectedSets)
+                        {
+                            if (existingSet != null && !string.IsNullOrWhiteSpace(existingSet.Name))
+                                usedSyntheticSetNames.Add(existingSet.Name);
+                        }
+
+                        foreach (ModelItem targetRootItem in allTargetLinkedRoots)
+                        {
+                            string targetRootDisplayName = SafeDisplayName(targetRootItem);
+                            string targetRootFileName = ExtractModelFileName(targetRootDisplayName);
+                            if (string.IsNullOrWhiteSpace(targetRootFileName))
+                                continue;
+
+                            if (mappedTargetRootDisplayNames.Contains(targetRootDisplayName))
+                                continue;
+
+                            string targetRootProjectPrefix;
+                            string targetRootStageToken;
+                            if (!TryGetProjectAndStageToken(
+                                targetRootFileName,
+                                out targetRootProjectPrefix,
+                                out targetRootStageToken))
+                            {
+                                continue;
+                            }
+
+                            // Ignore unrelated linked files from other projects/stages.
+                            if (!string.Equals(targetProjectPrefix, targetRootProjectPrefix, StringComparison.OrdinalIgnoreCase) ||
+                                !string.Equals(targetStageToken, targetRootStageToken, StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            string sectionCode = ExtractModelSectionCode(targetRootFileName);
+                            string generatedSetName = TransliterateSectionCodeToSetName(sectionCode);
+                            Dictionary<string, object> generatedRootReport =
+                                new Dictionary<string, object>();
+                            generatedRootReport["targetRootName"] = targetRootDisplayName;
+                            generatedRootReport["targetModelFileName"] = targetRootFileName;
+                            generatedRootReport["sectionCode"] = sectionCode;
+                            generatedRootReport["generatedSelectionSetName"] = generatedSetName;
+
+                            if (string.IsNullOrWhiteSpace(generatedSetName))
+                            {
+                                generatedRootReport["status"] = "BLOCKED_NAME_COULD_NOT_BE_DERIVED";
+                                autoGeneratedRootSetReports.Add(generatedRootReport);
+                                rootMappingReports.Add(BuildGeneratedRootMappingReport(
+                                    targetRootDisplayName,
+                                    targetRootFileName,
+                                    generatedSetName,
+                                    "AUTO_SET_NAME_NOT_DERIVED",
+                                    1));
+                                continue;
+                            }
+
+                            if (!usedSyntheticSetNames.Add(generatedSetName))
+                            {
+                                generatedRootReport["status"] = "BLOCKED_DUPLICATE_GENERATED_SET_NAME";
+                                autoGeneratedRootSetReports.Add(generatedRootReport);
+                                rootMappingReports.Add(BuildGeneratedRootMappingReport(
+                                    targetRootDisplayName,
+                                    targetRootFileName,
+                                    generatedSetName,
+                                    "AUTO_SET_NAME_COLLISION",
+                                    1));
+                                continue;
+                            }
+
+                            TargetNodeInfo indexedUnmappedRoot = CreateTargetRoot(
+                                targetRootItem,
+                                ref nodesInspected,
+                                ref targetNodesIndexed);
+                            if (indexedUnmappedRoot == null)
+                                continue;
+
+                            ExpectedSet generatedSet = CreateWholeRootExpectedSet(
+                                document,
+                                targetRootDisplayName,
+                                targetRootFileName,
+                                generatedSetName);
+
+                            if (indexedRootsByName.ContainsKey(targetRootDisplayName))
+                            {
+                                generatedRootReport["status"] = "BLOCKED_ROOT_KEY_COLLISION";
+                                autoGeneratedRootSetReports.Add(generatedRootReport);
+                                rootMappingReports.Add(BuildGeneratedRootMappingReport(
+                                    targetRootDisplayName,
+                                    targetRootFileName,
+                                    generatedSetName,
+                                    "AUTO_ROOT_KEY_COLLISION",
+                                    1));
+                                continue;
+                            }
+
+                            indexedRootsByName.Add(
+                                targetRootDisplayName,
+                                new List<TargetNodeInfo> { indexedUnmappedRoot });
+                            processedRootNames.Add(targetRootDisplayName);
+                            expectedSets.Add(generatedSet);
+                            expectedItemCount++;
+                            autoGeneratedRootSetCount++;
+
+                            generatedRootReport["status"] = "AUTO_SET_READY";
+                            autoGeneratedRootSetReports.Add(generatedRootReport);
+                            rootMappingReports.Add(BuildGeneratedRootMappingReport(
+                                targetRootDisplayName,
+                                targetRootFileName,
+                                generatedSetName,
+                                "FOUND",
+                                1));
+                        }
                     }
-
-                    foreach (ModelItem targetRootItem in allTargetLinkedRoots)
+                    else
                     {
-                        string targetRootDisplayName = SafeDisplayName(targetRootItem);
-                        string targetRootFileName = ExtractModelFileName(targetRootDisplayName);
-                        if (string.IsNullOrWhiteSpace(targetRootFileName))
-                            continue;
-
-                        if (mappedTargetRootDisplayNames.Contains(targetRootDisplayName))
-                            continue;
-
-                        string targetRootProjectPrefix;
-                        string targetRootStageToken;
-                        if (!TryGetProjectAndStageToken(
-                            targetRootFileName,
-                            out targetRootProjectPrefix,
-                            out targetRootStageToken))
+                        // Native policy is the source of truth. Never silently create a
+                        // whole-link set for an unknown section; report it and let preflight
+                        // block until the policy is deliberately updated.
+                        foreach (ModelItem targetRootItem in allTargetLinkedRoots)
                         {
-                            continue;
-                        }
+                            string targetRootDisplayName = SafeDisplayName(targetRootItem);
+                            if (mappedTargetRootDisplayNames.Contains(targetRootDisplayName))
+                                continue;
 
-                        // Ignore unrelated linked files from other projects/stages.
-                        if (!string.Equals(targetProjectPrefix, targetRootProjectPrefix, StringComparison.OrdinalIgnoreCase) ||
-                            !string.Equals(targetStageToken, targetRootStageToken, StringComparison.OrdinalIgnoreCase))
-                        {
-                            continue;
-                        }
+                            string targetRootFileName = ExtractModelFileName(targetRootDisplayName);
+                            if (string.IsNullOrWhiteSpace(targetRootFileName))
+                                continue;
 
-                        string sectionCode = ExtractModelSectionCode(targetRootFileName);
-                        string generatedSetName = TransliterateSectionCodeToSetName(sectionCode);
-                        Dictionary<string, object> generatedRootReport =
-                            new Dictionary<string, object>();
-                        generatedRootReport["targetRootName"] = targetRootDisplayName;
-                        generatedRootReport["targetModelFileName"] = targetRootFileName;
-                        generatedRootReport["sectionCode"] = sectionCode;
-                        generatedRootReport["generatedSelectionSetName"] = generatedSetName;
+                            if (universalNativeRebuild)
+                            {
+                                string rootProjectPrefix = ExtractProjectPrefixBeforeRdMarker(targetRootFileName);
+                                if (string.IsNullOrWhiteSpace(rootProjectPrefix))
+                                    continue;
+                                if (!string.IsNullOrWhiteSpace(universalProjectPrefix) &&
+                                    !string.Equals(universalProjectPrefix, rootProjectPrefix, StringComparison.OrdinalIgnoreCase))
+                                    continue;
+                            }
+                            else
+                            {
+                                string extraProjectPrefix;
+                                string extraStageToken;
+                                if (!TryGetProjectAndStageToken(targetRootFileName, out extraProjectPrefix, out extraStageToken) ||
+                                    !string.Equals(targetProjectPrefix, extraProjectPrefix, StringComparison.OrdinalIgnoreCase) ||
+                                    !string.Equals(targetStageToken, extraStageToken, StringComparison.OrdinalIgnoreCase))
+                                    continue;
+                            }
 
-                        if (string.IsNullOrWhiteSpace(generatedSetName))
-                        {
-                            generatedRootReport["status"] = "BLOCKED_NAME_COULD_NOT_BE_DERIVED";
-                            autoGeneratedRootSetReports.Add(generatedRootReport);
+                            Dictionary<string, object> unmappedReport = new Dictionary<string, object>();
+                            unmappedReport["targetRootName"] = targetRootDisplayName;
+                            unmappedReport["targetModelFileName"] = targetRootFileName;
+                            unmappedReport["status"] = "NATIVE_POLICY_REQUIRED_UNMAPPED_TARGET_ROOT";
+                            autoGeneratedRootSetReports.Add(unmappedReport);
                             rootMappingReports.Add(BuildGeneratedRootMappingReport(
                                 targetRootDisplayName,
                                 targetRootFileName,
-                                generatedSetName,
-                                "AUTO_SET_NAME_NOT_DERIVED",
+                                "",
+                                "UNMAPPED_TARGET_ROOT_NOT_IN_NATIVE_POLICY",
                                 1));
-                            continue;
                         }
-
-                        if (!usedSyntheticSetNames.Add(generatedSetName))
-                        {
-                            generatedRootReport["status"] = "BLOCKED_DUPLICATE_GENERATED_SET_NAME";
-                            autoGeneratedRootSetReports.Add(generatedRootReport);
-                            rootMappingReports.Add(BuildGeneratedRootMappingReport(
-                                targetRootDisplayName,
-                                targetRootFileName,
-                                generatedSetName,
-                                "AUTO_SET_NAME_COLLISION",
-                                1));
-                            continue;
-                        }
-
-                        TargetNodeInfo indexedUnmappedRoot = CreateTargetRoot(
-                            targetRootItem,
-                            ref nodesInspected,
-                            ref targetNodesIndexed);
-                        if (indexedUnmappedRoot == null)
-                            continue;
-
-                        ExpectedSet generatedSet = CreateWholeRootExpectedSet(
-                            document,
-                            targetRootDisplayName,
-                            targetRootFileName,
-                            generatedSetName);
-
-                        if (indexedRootsByName.ContainsKey(targetRootDisplayName))
-                        {
-                            generatedRootReport["status"] = "BLOCKED_ROOT_KEY_COLLISION";
-                            autoGeneratedRootSetReports.Add(generatedRootReport);
-                            rootMappingReports.Add(BuildGeneratedRootMappingReport(
-                                targetRootDisplayName,
-                                targetRootFileName,
-                                generatedSetName,
-                                "AUTO_ROOT_KEY_COLLISION",
-                                1));
-                            continue;
-                        }
-
-                        indexedRootsByName.Add(
-                            targetRootDisplayName,
-                            new List<TargetNodeInfo> { indexedUnmappedRoot });
-                        processedRootNames.Add(targetRootDisplayName);
-                        expectedSets.Add(generatedSet);
-                        expectedItemCount++;
-                        autoGeneratedRootSetCount++;
-
-                        generatedRootReport["status"] = "AUTO_SET_READY";
-                        autoGeneratedRootSetReports.Add(generatedRootReport);
-                        rootMappingReports.Add(BuildGeneratedRootMappingReport(
-                            targetRootDisplayName,
-                            targetRootFileName,
-                            generatedSetName,
-                            "FOUND",
-                            1));
                     }
                 }
                 else
@@ -438,6 +573,7 @@ namespace NavisCoordinator.Services
                     int setOneToManyCategoryMatches = 0;
                     int setOneToManyIdentityMatches = 0;
                     int setOneToManyStructuralMatches = 0;
+                    int setOneToManyNativePolicyMatches = 0;
                     int setIdentityDisambiguatedMatches = 0;
                     int setMissing = 0;
                     int setAmbiguous = 0;
@@ -534,6 +670,18 @@ namespace NavisCoordinator.Services
                                     oneToManyMatch = true;
                                     setOneToManyCategoryMatches++;
                                     oneToManyCategoryMatches++;
+                                    AddTargetHierarchyPaths(candidatePaths, targetHierarchyPaths);
+                                }
+                                else if (nativeRebuild && TryClassifyNativePolicyRepeatedCandidates(
+                                    expectedItem,
+                                    candidatePaths,
+                                    out fanOutReason))
+                                {
+                                    status = "MATCHED_ONE_TO_MANY_NATIVE_POLICY";
+                                    decisionReason = fanOutReason;
+                                    oneToManyMatch = true;
+                                    setOneToManyNativePolicyMatches++;
+                                    oneToManyNativePolicyMatches++;
                                     AddTargetHierarchyPaths(candidatePaths, targetHierarchyPaths);
                                 }
                                 else if (TryClassifyRepeatedCandidates(
@@ -655,6 +803,13 @@ namespace NavisCoordinator.Services
 
                     Dictionary<string, object> setReport = new Dictionary<string, object>();
                     setReport["name"] = expectedSet.Name;
+                    setReport["isNativePolicySet"] = expectedSet.IsNativePolicySet;
+                    setReport["nativeSectionCode"] = expectedSet.NativeSectionCode;
+                    setReport["nativeMode"] = expectedSet.NativeMode;
+                    setReport["nativeSourceModelFileName"] = expectedSet.NativeSourceModelFileName;
+                    setReport["nativeExpectedTargetModelFileName"] = expectedSet.NativeExpectedTargetModelFileName;
+                    setReport["nativeRuleExpansionStatus"] = expectedSet.NativeRuleExpansionStatus;
+                    setReport["nativeRuleExpansionItemCount"] = expectedSet.NativeRuleExpansionItemCount;
                     setReport["generatedFromUnmappedTargetRoot"] = expectedSet.GeneratedFromUnmappedTargetRoot;
                     setReport["generatedTargetModelFileName"] = expectedSet.GeneratedTargetModelFileName;
                     setReport["expectedItemCount"] = expectedSet.Items.Count;
@@ -663,6 +818,7 @@ namespace NavisCoordinator.Services
                     setReport["oneToManyCategoryMatchCount"] = setOneToManyCategoryMatches;
                     setReport["oneToManyIdentityMatchCount"] = setOneToManyIdentityMatches;
                     setReport["oneToManyStructuralMatchCount"] = setOneToManyStructuralMatches;
+                    setReport["oneToManyNativePolicyMatchCount"] = setOneToManyNativePolicyMatches;
                     setReport["identityDisambiguatedCount"] = setIdentityDisambiguatedMatches;
                     setReport["missingCount"] = setMissing;
                     setReport["ambiguousCount"] = setAmbiguous;
@@ -677,21 +833,57 @@ namespace NavisCoordinator.Services
                 string transferStatus = applyTransfer ? "NOT_STARTED" : "NOT_REQUESTED";
                 string transferError = "";
                 int createdSelectionSetCount = 0;
+                int replacedSelectionSetCount = 0;
                 int createdTargetModelItemCount = 0;
+                Dictionary<string, object> coverageAnalysis = nativeRebuild
+                    ? BuildCoverageAnalysis(expectedSets, indexedRootsByName)
+                    : null;
 
                 Dictionary<string, object> report = new Dictionary<string, object>();
-                report["reportFormatVersion"] = 9;
-                report["sourceDocumentTitle"] = GetDictionaryString(sourceDocument, "documentTitle");
+                report["reportFormatVersion"] = 10;
+                report["workflowMode"] = nativeRebuild ? "NATIVE_REBUILD_FROM_SECTION_POLICY" : "LEGACY_JSON_TRANSFER";
+                report["nativeRebuildMode"] = nativeRebuild;
+                report["sourceDocumentTitle"] = nativeRebuild
+                    ? GetDictionaryString(sourceDocument, "title")
+                    : GetDictionaryString(sourceDocument, "documentTitle");
                 report["sourceExportedAt"] = GetDictionaryString(sourceDocument, "exportedAt");
+                report["policySourceStage"] = nativeRebuild
+                    ? GetDictionaryString(AsDictionary(GetDictionaryValue(sourceDocument, "policySource")), "stage")
+                    : "";
+                report["coverageAnalysis"] = coverageAnalysis;
+                report["nativeRuleExpansion"] = nativeRebuild ? nativeRuleExpansionReports : null;
+                report["nativePolicyPath"] = nativeRebuild ? sourceJsonPath : "";
+                report["nativePolicySetCount"] = nativeRebuild ? expectedSets.Count : 0;
+                report["nativePolicyWholeLinkSetCount"] = nativeRebuild
+                    ? CountNativePolicySetsByMode(expectedSets, "wholeLink") : 0;
+                report["nativePolicyExplicitNodeSetCount"] = nativeRebuild
+                    ? CountNativePolicySetsByMode(expectedSets, "explicitNodes") : 0;
+                report["nativePolicyRuleBasedSetCount"] = nativeRebuild
+                    ? CountNativePolicySetsByMode(expectedSets, "ruleBased") : 0;
+                report["nativePolicyRuleExpansionEngine"] = nativeRebuild
+                    ? (universalNativeRebuild
+                        ? "universal-linked-root-discovery-and-target-tree-category-allowlist-v1"
+                        : "target-tree-category-allowlist-and-path-rule-expansion-v1")
+                    : "";
+                report["nativePolicyNewSplitRootSetCount"] = nativeRebuild
+                    ? CountNativePolicySetsBySections(expectedSets, new string[] { "АСКУЭ", "АСКУВТ" }) : 0;
                 report["targetDocumentTitle"] = document.Title ?? "";
                 report["generatedAt"] = DateTime.Now.ToString(
                     "yyyy-MM-dd HH:mm:ss",
                     CultureInfo.InvariantCulture);
                 report["searchMethod"] = "indexed-linked-model-trees-with-cached-descendant-matches-identity-disambiguation-and-guarded-repeated-level-fan-out";
                 report["searchOptimization"] = "expand-LcRevitLayer-by-ModelItem.ClassName; expand-category-nodes-by-Element.Type; count-node-name-comparisons-once; stop-after-global-search-limit";
-                report["rootMappingPolicy"] = rootOverridesConfigExists
-                    ? "RVT filename lookup by default; rootOverrides.json maps source RVT filenames to renamed or reassigned target RVT filenames. Navisworks position suffixes are ignored."
-                    : "RVT filename lookup by default; rootOverrides.json was not found next to the selected source JSON.";
+                report["rootMappingPolicy"] = universalNativeRebuild
+                    ? "Universal mode: discover current-project RVT roots by _РД_ prefix and configured section code; map each root directly by its actual RVT filename; stage and fixed root count are not used."
+                    : (rootOverridesConfigExists
+                        ? "RVT filename lookup by default; rootOverrides.json maps source RVT filenames to renamed or reassigned target RVT filenames. Navisworks position suffixes are ignored."
+                        : "RVT filename lookup by default; rootOverrides.json was not found next to the selected source JSON.");
+                report["universalNativeRebuild"] = universalNativeRebuild;
+                report["universalProjectPrefix"] = universalNativeRebuild ? universalProjectPrefix : "";
+                report["universalDetectedRoots"] = universalNativeRebuild
+                    ? GetDictionaryValue(sourceDocument, "universalDetectedRoots") : null;
+                report["universalUnsupportedRootsAtExpansion"] = universalNativeRebuild
+                    ? GetDictionaryValue(sourceDocument, "universalUnsupportedRootsAtExpansion") : null;
                 report["rootOverridesConfigPath"] = rootOverridesPath;
                 report["rootOverridesConfigLoaded"] = rootOverridesConfigExists;
                 report["rootOverridesCount"] = rootOverrides.Count;
@@ -701,11 +893,19 @@ namespace NavisCoordinator.Services
                 report["autoGeneratedRootSetCount"] = autoGeneratedRootSetCount;
                 report["autoGeneratedRootSets"] = autoGeneratedRootSetReports;
                 report["targetLinkedRootCount"] = allTargetLinkedRoots.Count;
-                report["targetProjectPrefixForAutoSets"] = targetProjectStageKnown ? targetProjectPrefix : "";
-                report["targetStageTokenForAutoSets"] = targetProjectStageKnown ? targetStageToken : "";
+                report["targetProjectPrefixForAutoSets"] = universalNativeRebuild
+                    ? universalProjectPrefix
+                    : (targetProjectStageKnown ? targetProjectPrefix : "");
+                report["targetStageTokenForAutoSets"] = universalNativeRebuild
+                    ? "NOT_USED_IN_UNIVERSAL_MODE"
+                    : (targetProjectStageKnown ? targetStageToken : "");
                 report["categoryFanOutRule"] = "source-and-target-terminal-nodes-are-categories-and-all-candidates-share-one-target-root";
                 report["identityFanOutRule"] = "all-nonempty-source-identity-properties-match-every-candidate; candidates share one target root and repeat across distinct LcRevitLayer nodes with the same canonical path";
                 report["structuralFanOutRule"] = "source-and-target nodes have no readable identity values; candidates share one target root and repeat across distinct LcRevitLayer nodes with the same canonical path after level nodes are excluded";
+                report["nativePolicyFanOutRule"] = "for native policy Family/Type paths, include all same canonical-path candidates under distinct LcRevitLayer nodes when every candidate has the expected terminal type and all candidates belong to one mapped linked-model root";
+                report["targetSetNameHandling"] = nativeRebuild
+                    ? "replace exactly-one top-level SelectionSet with canonical name; create if absent; block nested folders, duplicate names, or non-SelectionSet collisions"
+                    : "never overwrite an existing saved item with the same name";
                 report["maxIntermediateSearchDepth"] = MaxIntermediateSearchDepth;
                 report["targetNodesInspected"] = nodesInspected;
                 report["targetNodesIndexed"] = targetNodesIndexed;
@@ -719,7 +919,8 @@ namespace NavisCoordinator.Services
                 report["identityDisambiguatedCount"] = identityDisambiguatedMatches;
                 report["oneToManyIdentityMatchCount"] = oneToManyIdentityMatches;
                 report["oneToManyStructuralMatchCount"] = oneToManyStructuralMatches;
-                report["resolvedItemCount"] = uniqueMatches + oneToManyCategoryMatches + oneToManyIdentityMatches + oneToManyStructuralMatches;
+                report["oneToManyNativePolicyMatchCount"] = oneToManyNativePolicyMatches;
+                report["resolvedItemCount"] = uniqueMatches + oneToManyCategoryMatches + oneToManyIdentityMatches + oneToManyStructuralMatches + oneToManyNativePolicyMatches;
                 report["missingCount"] = missingItems;
                 report["ambiguousCount"] = ambiguousItems;
                 report["searchLimitItemCount"] = searchLimitItems;
@@ -739,9 +940,9 @@ namespace NavisCoordinator.Services
                         ? "Сохранить отчёт переноса Selection Sets"
                         : "Сохранить отчёт проверки Selection Sets";
                     dialog.Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*";
-                    dialog.FileName = (applyTransfer
-                        ? "NavisCoordinator_TransferReport_"
-                        : "NavisCoordinator_MatchReport_") +
+                    dialog.FileName = (nativeRebuild
+                        ? (applyTransfer ? "NavisCoordinator_NativeRebuildReport_" : "NavisCoordinator_NativeRebuildDryRun_")
+                        : (applyTransfer ? "NavisCoordinator_TransferReport_" : "NavisCoordinator_MatchReport_")) +
                         DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json";
                     dialog.InitialDirectory = Environment.GetFolderPath(
                         Environment.SpecialFolder.Desktop);
@@ -769,14 +970,16 @@ namespace NavisCoordinator.Services
                             expectedSets,
                             resolvedTargetItemsBySet,
                             rootMappingReports,
+                            nativeRuleExpansionReports,
                             expectedItemCount,
                             uniqueMatches + oneToManyCategoryMatches +
-                                oneToManyIdentityMatches + oneToManyStructuralMatches,
+                                oneToManyIdentityMatches + oneToManyStructuralMatches + oneToManyNativePolicyMatches,
                             missingItems,
                             ambiguousItems,
                             searchLimitItems,
                             identityWarningCount,
                             searchLimitReached,
+                            nativeRebuild,
                             out validationDetails))
                         {
                             transferStatus = "BLOCKED_PREFLIGHT";
@@ -796,13 +999,22 @@ namespace NavisCoordinator.Services
                             DialogResult transferChoice = MessageBox.Show(
                                 "Предварительная проверка пройдена.\n\n" +
                                 "Целевой документ: " + (document.Title ?? "") + "\n" +
-                                "Selection Sets для создания: " + expectedSets.Count + "\n" +
-                                "Дополнительных наборов для новых связанных моделей: " + autoGeneratedRootSetCount + "\n" +
+                                (nativeRebuild ? "Selection Sets для нативного построения: " : "Selection Sets для создания: ") + expectedSets.Count + "\n" +
+                                (nativeRebuild
+                                    ? "Наборов по политике для новых связей АСКУЭ/АСКУВТ: " + CountNativePolicySetsBySections(expectedSets, new string[] { "АСКУЭ", "АСКУВТ" }) + "\n"
+                                    : "Дополнительных наборов для новых связанных моделей: " + autoGeneratedRootSetCount + "\n") +
+                                (nativeRebuild
+                                    ? "Существующих наборов будет заменено по имени: " + CountReusableTargetSets(document, expectedSets) + "\n"
+                                    : "") +
                                 "Суммарно уникальных целевых узлов во всех наборах: " + targetItemTotal + "\n\n" +
                                 "ВАЖНО: продолжайте только если открыт РАБОЧИЙ КЛОН целевого NWF.\n" +
-                                "Существующие наборы с такими именами не перезаписываются.\n" +
+                                (nativeRebuild
+                                    ? (universalNativeRebuild
+                                        ? "Универсальный режим построит наборы по профилям разделов, найденным в текущем NWF, заменяя только уникальные одноимённые Selection Sets верхнего уровня и создавая отсутствующие.\n"
+                                        : "Нативный режим построит наборы по выбранной политике разделов, заменяя только уникальные одноимённые Selection Sets верхнего уровня и создавая отсутствующие.\n")
+                                    : "Существующие наборы с такими именами не перезаписываются.\n") +
                                 "Документ будет изменён в памяти; автоматического сохранения на диск не будет.\n\n" +
-                                "Создать Selection Sets?",
+                                (nativeRebuild ? "Пересобрать Selection Sets по политике?" : "Создать Selection Sets?"),
                                 "Navis Coordinator — подтверждение переноса",
                                 MessageBoxButtons.YesNo,
                                 MessageBoxIcon.Warning);
@@ -811,12 +1023,25 @@ namespace NavisCoordinator.Services
                             {
                                 try
                                 {
-                                    CreateSelectionSets(
-                                        document,
-                                        expectedSets,
-                                        resolvedTargetItemsBySet,
-                                        out createdSelectionSetCount,
-                                        out createdTargetModelItemCount);
+                                    if (nativeRebuild)
+                                    {
+                                        CreateOrReplaceNativeSelectionSets(
+                                            document,
+                                            expectedSets,
+                                            resolvedTargetItemsBySet,
+                                            out createdSelectionSetCount,
+                                            out replacedSelectionSetCount,
+                                            out createdTargetModelItemCount);
+                                    }
+                                    else
+                                    {
+                                        CreateSelectionSets(
+                                            document,
+                                            expectedSets,
+                                            resolvedTargetItemsBySet,
+                                            out createdSelectionSetCount,
+                                            out createdTargetModelItemCount);
+                                    }
                                     transferApplied = true;
                                     modelMayBeModified = true;
                                     transferStatus = "APPLIED_UNSAVED";
@@ -835,7 +1060,7 @@ namespace NavisCoordinator.Services
                                     MessageBox.Show(
                                         "Во время создания Selection Sets произошла ошибка.\n\n" +
                                         transferException.Message +
-                                        "\n\nПлагин попытался удалить наборы, созданные в рамках этой операции.\n" +
+                                        "\n\nПлагин попытался откатить все изменения этой операции.\n" +
                                         "Проверьте окно Selection Sets и не сохраняйте документ, пока не убедитесь в результате.\n\n" +
                                         "Полная ошибка записана в JSON-отчёт.",
                                         "Navis Coordinator — ошибка переноса",
@@ -853,6 +1078,7 @@ namespace NavisCoordinator.Services
                     report["transferStatus"] = transferStatus;
                     report["transferError"] = transferError;
                     report["createdSelectionSetCount"] = createdSelectionSetCount;
+                    report["replacedSelectionSetCount"] = replacedSelectionSetCount;
                     report["createdTargetModelItemCount"] = createdTargetModelItemCount;
                     report["modelWasModified"] = modelMayBeModified;
 
@@ -862,7 +1088,9 @@ namespace NavisCoordinator.Services
 
                     ShowSummary(
                         dialog.FileName,
-                        GetDictionaryString(sourceDocument, "documentTitle"),
+                        nativeRebuild
+                            ? GetDictionaryString(sourceDocument, "title")
+                            : GetDictionaryString(sourceDocument, "documentTitle"),
                         document.Title ?? "",
                         expectedSets.Count,
                         expectedItemCount,
@@ -870,6 +1098,7 @@ namespace NavisCoordinator.Services
                         oneToManyCategoryMatches,
                         oneToManyIdentityMatches,
                         oneToManyStructuralMatches,
+                        oneToManyNativePolicyMatches,
                         identityDisambiguatedMatches,
                         missingItems,
                         ambiguousItems,
@@ -883,6 +1112,7 @@ namespace NavisCoordinator.Services
                         transferApplied,
                         transferStatus,
                         createdSelectionSetCount,
+                        replacedSelectionSetCount,
                         createdTargetModelItemCount,
                         transferError);
                 }
@@ -909,7 +1139,8 @@ namespace NavisCoordinator.Services
             return string.Equals(status, "MATCHED", StringComparison.Ordinal) ||
                    string.Equals(status, "MATCHED_ONE_TO_MANY_CATEGORY", StringComparison.Ordinal) ||
                    string.Equals(status, "MATCHED_ONE_TO_MANY_IDENTITY", StringComparison.Ordinal) ||
-                   string.Equals(status, "MATCHED_ONE_TO_MANY_STRUCTURAL", StringComparison.Ordinal);
+                   string.Equals(status, "MATCHED_ONE_TO_MANY_STRUCTURAL", StringComparison.Ordinal) ||
+                   string.Equals(status, "MATCHED_ONE_TO_MANY_NATIVE_POLICY", StringComparison.Ordinal);
         }
 
         private static bool ValidateTransferPreconditions(
@@ -917,6 +1148,7 @@ namespace NavisCoordinator.Services
             List<ExpectedSet> expectedSets,
             Dictionary<ExpectedSet, Dictionary<string, ModelItem>> resolvedTargetItemsBySet,
             List<object> rootMappingReports,
+            List<object> nativeRuleExpansionReports,
             int expectedItemCount,
             int resolvedItemCount,
             int missingItems,
@@ -924,6 +1156,7 @@ namespace NavisCoordinator.Services
             int searchLimitItems,
             int identityWarningCount,
             bool searchLimitReached,
+            bool nativeRebuildMode,
             out string details)
         {
             List<string> problems = new List<string>();
@@ -1000,6 +1233,24 @@ namespace NavisCoordinator.Services
                 }
             }
 
+            if (nativeRebuildMode && nativeRuleExpansionReports != null)
+            {
+                foreach (object rawRuleReport in nativeRuleExpansionReports)
+                {
+                    Dictionary<string, object> ruleReport = AsDictionary(rawRuleReport);
+                    if (ruleReport == null) continue;
+                    string ruleStatus = GetDictionaryString(ruleReport, "status");
+                    if (string.Equals(ruleStatus, "REQUIRED_CATEGORY_NOT_FOUND", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(ruleStatus, "SEARCH_TRUNCATED", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(ruleStatus, "SEARCH_LIMIT_REACHED", StringComparison.OrdinalIgnoreCase) ||
+                        ruleStatus.StartsWith("BLOCKED_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        problems.Add("Native rule expansion для раздела '" +
+                            GetDictionaryString(ruleReport, "sectionCode") + "' не прошёл проверку: " + ruleStatus + ".");
+                    }
+                }
+            }
+
             if (document != null && !document.IsClear)
             {
                 HashSet<string> existingNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1011,8 +1262,24 @@ namespace NavisCoordinator.Services
                         if (expectedSet != null && !string.IsNullOrWhiteSpace(expectedSet.Name) &&
                             existingNames.Contains(expectedSet.Name))
                         {
-                            problems.Add("В целевом документе уже существует набор или папка с именем '" +
-                                         expectedSet.Name + "'. Ничего не будет перезаписано.");
+                            if (!nativeRebuildMode)
+                            {
+                                problems.Add("В целевом документе уже существует набор или папка с именем '" +
+                                             expectedSet.Name + "'. Ничего не будет перезаписано.");
+                            }
+                            else
+                            {
+                                SavedItem topLevel = FindTopLevelSavedItemByName(document, expectedSet.Name);
+                                int nameCount = CountSavedItemsNamed(
+                                    document.SelectionSets.RootItem.Children,
+                                    expectedSet.Name);
+                                if (!(topLevel is SelectionSet) || nameCount != 1)
+                                {
+                                    problems.Add("В нативном режиме имя '" + expectedSet.Name +
+                                        "' можно переиспользовать только при наличии ровно одного одноимённого Selection Set верхнего уровня. " +
+                                        "Обнаружено совпадений: " + nameCount + ". Исправьте структуру Sets или используйте чистую рабочую копию.");
+                                }
+                            }
                         }
                     }
                 }
@@ -1064,7 +1331,7 @@ namespace NavisCoordinator.Services
             foreach (SavedItem savedItem in document.SelectionSets.RootItem.Children)
             {
                 if (savedItem != null &&
-                    string.Equals(savedItem.DisplayName ?? "", displayName, StringComparison.Ordinal))
+                    string.Equals(savedItem.DisplayName ?? "", displayName, StringComparison.OrdinalIgnoreCase))
                     return savedItem;
             }
 
@@ -1633,6 +1900,450 @@ namespace NavisCoordinator.Services
             }
 
             return result.ToString().ToUpperInvariant();
+        }
+
+        private static int CountNativePolicySetsByMode(List<ExpectedSet> sets, string mode)
+        {
+            int count = 0;
+            if (sets == null) return count;
+            foreach (ExpectedSet set in sets)
+            {
+                if (set != null && set.IsNativePolicySet &&
+                    string.Equals(set.NativeMode, mode, StringComparison.OrdinalIgnoreCase))
+                    count++;
+            }
+            return count;
+        }
+
+        private static int CountNativePolicySetsBySections(List<ExpectedSet> sets, string[] sectionCodes)
+        {
+            int count = 0;
+            if (sets == null || sectionCodes == null) return count;
+            foreach (ExpectedSet set in sets)
+            {
+                if (set == null || !set.IsNativePolicySet) continue;
+                foreach (string sectionCode in sectionCodes)
+                {
+                    if (string.Equals(set.NativeSectionCode, sectionCode, StringComparison.OrdinalIgnoreCase))
+                    {
+                        count++;
+                        break;
+                    }
+                }
+            }
+            return count;
+        }
+
+        private static Dictionary<string, object> BuildCoverageAnalysis(
+            List<ExpectedSet> expectedSets,
+            Dictionary<string, List<TargetNodeInfo>> indexedRootsByName)
+        {
+            const int maxInspectedNodesPerRoot = 150000;
+            Dictionary<string, object> coverage = new Dictionary<string, object>();
+            coverage["formatVersion"] = 1;
+            coverage["analysisType"] = "target-category-inventory-vs-native-section-policy";
+            coverage["autoIncludeUnlistedCategories"] = false;
+            coverage["unlistedCategoryHandling"] = "report-only; no unlisted category is added to a Selection Set automatically";
+            coverage["maxNodesInspectedPerRoot"] = maxInspectedNodesPerRoot;
+
+            Dictionary<string, ExpectedSet> bySection = new Dictionary<string, ExpectedSet>(StringComparer.OrdinalIgnoreCase);
+            if (expectedSets != null)
+            {
+                foreach (ExpectedSet set in expectedSets)
+                {
+                    if (set != null && !string.IsNullOrWhiteSpace(set.NativeSectionCode))
+                        bySection[set.NativeSectionCode] = set;
+                }
+            }
+
+            List<object> sectionReports = new List<object>();
+            int totalObservedCategoryNames = 0;
+            int totalUnclassifiedCategoryNames = 0;
+            int incompleteRootScans = 0;
+
+            foreach (KeyValuePair<string, ExpectedSet> sectionPair in bySection)
+            {
+                ExpectedSet set = sectionPair.Value;
+                Dictionary<string, object> sectionReport = new Dictionary<string, object>();
+                sectionReport["sectionCode"] = set.NativeSectionCode;
+                sectionReport["selectionSetName"] = set.Name;
+                sectionReport["mode"] = set.NativeMode;
+                sectionReport["sourceModelFileName"] = set.NativeSourceModelFileName;
+                sectionReport["expectedTargetModelFileName"] = set.NativeExpectedTargetModelFileName;
+
+                List<string> selectedWholeCategories = new List<string>();
+                HashSet<string> selectedDescendantCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (ExpectedItem expectedItem in set.Items)
+                {
+                    List<string> pathSegments = GetSourcePathSegments(expectedItem.HierarchyNodes);
+                    if (pathSegments.Count < 2) continue;
+                    string categoryName = pathSegments[1];
+                    string terminalType = GetExpectedTerminalNodeType(expectedItem);
+                    if (pathSegments.Count == 2 && IsCategoryType(terminalType))
+                        selectedWholeCategories.Add(categoryName);
+                    else
+                        selectedDescendantCategories.Add(categoryName);
+                }
+
+                TargetNodeInfo rootInfo = null;
+                List<TargetNodeInfo> possibleRoots;
+                if (indexedRootsByName != null &&
+                    indexedRootsByName.TryGetValue(set.NativeSourceModelFileName, out possibleRoots) &&
+                    possibleRoots != null && possibleRoots.Count == 1)
+                    rootInfo = possibleRoots[0];
+
+                if (rootInfo == null || rootInfo.Item == null)
+                {
+                    sectionReport["inventoryStatus"] = "TARGET_ROOT_NOT_INDEXED_UNIQUELY";
+                    sectionReport["observedCategoryCount"] = 0;
+                    sectionReport["categories"] = new List<object>();
+                    sectionReports.Add(sectionReport);
+                    incompleteRootScans++;
+                    continue;
+                }
+
+                Dictionary<string, int> observedCategoryCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                Queue<ModelItem> queue = new Queue<ModelItem>();
+                HashSet<ModelItem> visited = new HashSet<ModelItem>();
+                queue.Enqueue(rootInfo.Item);
+                int inspected = 0;
+                bool truncated = false;
+
+                while (queue.Count > 0)
+                {
+                    ModelItem current = queue.Dequeue();
+                    if (current == null || !visited.Add(current)) continue;
+                    inspected++;
+                    if (inspected > maxInspectedNodesPerRoot)
+                    {
+                        truncated = true;
+                        break;
+                    }
+
+                    string elementType = GetModelItemPropertyValue(current, "Элемент", "Тип");
+                    bool isCategory = IsCategoryType(elementType);
+                    if (isCategory)
+                    {
+                        string categoryName = SafeDisplayName(current);
+                        if (!string.IsNullOrWhiteSpace(categoryName))
+                        {
+                            int occurrences;
+                            observedCategoryCounts.TryGetValue(categoryName, out occurrences);
+                            observedCategoryCounts[categoryName] = occurrences + 1;
+                        }
+                    }
+
+                    bool shouldExpand;
+                    if (inspected == 1)
+                        shouldExpand = true;
+                    else
+                    {
+                        string className = SafeModelItemClassName(current);
+                        shouldExpand = string.Equals(className, "LcRevitLayer", StringComparison.OrdinalIgnoreCase) || isCategory;
+                    }
+
+                    if (!shouldExpand) continue;
+                    try
+                    {
+                        foreach (ModelItem child in current.Children)
+                            if (child != null) queue.Enqueue(child);
+                    }
+                    catch
+                    {
+                        // Preserve a useful partial coverage report; preflight matching
+                        // separately decides whether the selected paths are resolvable.
+                    }
+                }
+
+                List<string> observedNames = new List<string>(observedCategoryCounts.Keys);
+                observedNames.Sort(StringComparer.OrdinalIgnoreCase);
+                List<object> categoryReports = new List<object>();
+                int sectionUnclassified = 0;
+                foreach (string categoryName in observedNames)
+                {
+                    bool wholeLink = string.Equals(set.NativeMode, "wholeLink", StringComparison.OrdinalIgnoreCase);
+                    bool selectedWhole = selectedWholeCategories.Exists(x => string.Equals(x, categoryName, StringComparison.OrdinalIgnoreCase));
+                    bool selectedDescendant = selectedDescendantCategories.Contains(categoryName);
+                    string classification;
+                    string status;
+                    if (wholeLink)
+                    {
+                        classification = "coveredByWholeLink";
+                        status = "includedByPolicy";
+                    }
+                    else if (selectedWhole)
+                    {
+                        classification = "selectedCategoryWhole";
+                        status = "includedByPolicy";
+                    }
+                    else if (selectedDescendant)
+                    {
+                        // The category itself is not selected as one broad node, but configured
+                        // descendants (for example, allowed pipe types under VK / Трубы) are.
+                        classification = "partiallyCoveredByDescendants";
+                        status = "includedByPolicy_partially";
+                    }
+                    else if (IsNativeRuleExcludedCategory(set, categoryName))
+                    {
+                        // Exclusions belong to one section only. For example, pipe insulation is
+                        // excluded from VK while the whole Трубы category may still be selected
+                        // by another section's policy.
+                        classification = "explicitlyExcludedBySectionRule";
+                        status = "explicitlyNotSelected_byRule";
+                    }
+                    else
+                    {
+                        string hint = GetNativeCategoryClassificationHint(set.NativeSectionCode, categoryName);
+                        if (!string.IsNullOrWhiteSpace(hint))
+                        {
+                            classification = hint;
+                            status = "explicitlyNotSelected_byConvention";
+                        }
+                        else
+                        {
+                            classification = "newOrUnclassified";
+                            status = "reviewNotAutoIncluded";
+                            sectionUnclassified++;
+                        }
+                    }
+
+                    Dictionary<string, object> categoryReport = new Dictionary<string, object>();
+                    categoryReport["categoryName"] = categoryName;
+                    categoryReport["occurrencesAcrossLevels"] = observedCategoryCounts[categoryName];
+                    categoryReport["coverageStatus"] = status;
+                    categoryReport["classification"] = classification;
+                    categoryReports.Add(categoryReport);
+                }
+
+                sectionReport["inventoryStatus"] = truncated ? "TRUNCATED_NODE_LIMIT" : "COMPLETE_WITHIN_POLICY_TREE_RULES";
+                sectionReport["nodesInspected"] = Math.Min(inspected, maxInspectedNodesPerRoot);
+                sectionReport["truncated"] = truncated;
+                sectionReport["observedCategoryCount"] = observedCategoryCounts.Count;
+                sectionReport["unclassifiedCategoryCount"] = sectionUnclassified;
+                sectionReport["categories"] = categoryReports;
+                sectionReport["wholeLinkCoversAllObservedCategories"] = string.Equals(set.NativeMode, "wholeLink", StringComparison.OrdinalIgnoreCase);
+                sectionReports.Add(sectionReport);
+                totalObservedCategoryNames += observedCategoryCounts.Count;
+                totalUnclassifiedCategoryNames += sectionUnclassified;
+                if (truncated) incompleteRootScans++;
+            }
+
+            coverage["sections"] = sectionReports;
+            coverage["sectionCount"] = sectionReports.Count;
+            coverage["totalObservedCategoryNameCount"] = totalObservedCategoryNames;
+            coverage["totalUnclassifiedCategoryNameCount"] = totalUnclassifiedCategoryNames;
+            coverage["incompleteRootScanCount"] = incompleteRootScans;
+            coverage["isComplete"] = incompleteRootScans == 0;
+            return coverage;
+        }
+
+        private static bool IsNativeRuleExcludedCategory(ExpectedSet set, string categoryName)
+        {
+            if (set == null || set.NativeRuleConfig == null || string.IsNullOrWhiteSpace(categoryName))
+                return false;
+
+            List<string> excludedNames = ReadNativeRuleStringList(
+                set.NativeRuleConfig,
+                "categoryExcludeList");
+            return ContainsIgnoreCase(excludedNames, categoryName);
+        }
+
+        private static string GetNativeCategoryClassificationHint(string sectionCode, string categoryName)
+        {
+            if (string.Equals(categoryName, "Осевая линия", StringComparison.OrdinalIgnoreCase))
+                return "known-system-category-not-in-selection-policy";
+
+            // sectionCode now describes the ACTUAL target linked model, not the legacy source set.
+            // Actual OV1 is the pipe model; actual OV2 is the duct model.
+            if ((string.Equals(sectionCode, "ВК", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(sectionCode, "ОВ1", StringComparison.OrdinalIgnoreCase)) &&
+                string.Equals(categoryName, "Материалы изоляции труб", StringComparison.OrdinalIgnoreCase))
+                return "known-not-selected-in-P1-policy";
+
+            if (string.Equals(sectionCode, "ОВ2", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(categoryName, "Материалы изоляции воздуховодов", StringComparison.OrdinalIgnoreCase))
+                return "known-not-selected-in-P1-policy";
+
+            if (string.Equals(sectionCode, "СС", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(categoryName, "Гибкие трубы", StringComparison.OrdinalIgnoreCase))
+                return "explicitly-excluded-for-CC";
+
+            return "";
+        }
+
+        private static int CountSavedItemsNamed(SavedItemCollection collection, string displayName)
+        {
+            if (collection == null || string.IsNullOrWhiteSpace(displayName)) return 0;
+            int count = 0;
+            foreach (SavedItem item in collection)
+            {
+                if (item == null) continue;
+                if (string.Equals(item.DisplayName ?? "", displayName, StringComparison.OrdinalIgnoreCase))
+                    count++;
+                FolderItem folder = item as FolderItem;
+                if (folder != null)
+                    count += CountSavedItemsNamed(folder.Children, displayName);
+            }
+            return count;
+        }
+
+        private static int CountReusableTargetSets(Document document, List<ExpectedSet> expectedSets)
+        {
+            if (document == null || document.IsClear || expectedSets == null) return 0;
+            int count = 0;
+            foreach (ExpectedSet expectedSet in expectedSets)
+            {
+                if (expectedSet == null || string.IsNullOrWhiteSpace(expectedSet.Name)) continue;
+                int matches = CountSavedItemsNamed(document.SelectionSets.RootItem.Children, expectedSet.Name);
+                if (matches == 1 && FindTopLevelSavedItemByName(document, expectedSet.Name) is SelectionSet)
+                    count++;
+            }
+            return count;
+        }
+
+        private sealed class NativeSetChange
+        {
+            public string Name = "";
+            public bool WasReplacement;
+            public SavedItem Backup;
+            public GroupItem Parent;
+            public int Index;
+            public int TargetItemCount;
+        }
+
+        private static void CreateOrReplaceNativeSelectionSets(
+            Document document,
+            List<ExpectedSet> expectedSets,
+            Dictionary<ExpectedSet, Dictionary<string, ModelItem>> resolvedTargetItemsBySet,
+            out int createdSelectionSetCount,
+            out int replacedSelectionSetCount,
+            out int createdTargetModelItemCount)
+        {
+            createdSelectionSetCount = 0;
+            replacedSelectionSetCount = 0;
+            createdTargetModelItemCount = 0;
+            List<NativeSetChange> changes = new List<NativeSetChange>();
+
+            try
+            {
+                foreach (ExpectedSet expectedSet in expectedSets)
+                {
+                    Dictionary<string, ModelItem> targetItemsByPath;
+                    if (!resolvedTargetItemsBySet.TryGetValue(expectedSet, out targetItemsByPath) ||
+                        targetItemsByPath == null || targetItemsByPath.Count == 0)
+                    {
+                        throw new InvalidOperationException("Для нативного Selection Set '" + expectedSet.Name + "' не подготовлены целевые узлы.");
+                    }
+
+                    ModelItemCollection targetItems = new ModelItemCollection();
+                    foreach (KeyValuePair<string, ModelItem> pair in targetItemsByPath)
+                        if (pair.Value != null) targetItems.Add(pair.Value);
+                    if (targetItems.Count == 0)
+                        throw new InvalidOperationException("Нативный Selection Set '" + expectedSet.Name + "' пуст после разрешения ссылок.");
+
+                    SelectionSet newSet = new SelectionSet(targetItems);
+                    newSet.DisplayName = expectedSet.Name;
+
+                    int namedCount = CountSavedItemsNamed(document.SelectionSets.RootItem.Children, expectedSet.Name);
+                    SavedItem existingTopLevel = FindTopLevelSavedItemByName(document, expectedSet.Name);
+                    if (namedCount == 0)
+                    {
+                        document.SelectionSets.AddCopy(newSet);
+                        NativeSetChange createdChange = new NativeSetChange();
+                        createdChange.Name = expectedSet.Name;
+                        createdChange.WasReplacement = false;
+                        createdChange.TargetItemCount = targetItems.Count;
+                        changes.Add(createdChange);
+                        if (!(FindTopLevelSavedItemByName(document, expectedSet.Name) is SelectionSet))
+                            throw new InvalidOperationException("После добавления не найден верхнеуровневый Selection Set '" + expectedSet.Name + "'.");
+                        createdSelectionSetCount++;
+                    }
+                    else
+                    {
+                        if (namedCount != 1 || !(existingTopLevel is SelectionSet))
+                            throw new InvalidOperationException("Имя '" + expectedSet.Name + "' нельзя безопасно заменить: обнаружено совпадений=" + namedCount + ".");
+
+                        SelectionSet backup = (existingTopLevel as SelectionSet).CreateCopy() as SelectionSet;
+                        if (backup == null)
+                            throw new InvalidOperationException("Не удалось создать резервную копию Selection Set '" + expectedSet.Name + "'.");
+
+                        GroupItem rootParent = document.SelectionSets.RootItem;
+                        int index = -1;
+                        for (int i = 0; i < rootParent.Children.Count; i++)
+                        {
+                            SavedItem sibling = rootParent.Children[i];
+                            if (sibling is SelectionSet && string.Equals(
+                                sibling.DisplayName ?? "", expectedSet.Name, StringComparison.OrdinalIgnoreCase))
+                            {
+                                index = i;
+                                break;
+                            }
+                        }
+                        if (index < 0)
+                            throw new InvalidOperationException("Не удалось определить позицию существующего Selection Set '" + expectedSet.Name + "'.");
+
+                        NativeSetChange replacement = new NativeSetChange();
+                        replacement.Name = expectedSet.Name;
+                        replacement.WasReplacement = true;
+                        replacement.Backup = backup;
+                        replacement.Parent = rootParent;
+                        replacement.Index = index;
+                        replacement.TargetItemCount = targetItems.Count;
+                        changes.Add(replacement);
+
+                        document.SelectionSets.ReplaceWithCopy(rootParent, index, newSet);
+                        if (!(FindTopLevelSavedItemByName(document, expectedSet.Name) is SelectionSet))
+                            throw new InvalidOperationException("После замены не найден верхнеуровневый Selection Set '" + expectedSet.Name + "'.");
+                        replacedSelectionSetCount++;
+                    }
+                    createdTargetModelItemCount += targetItems.Count;
+                }
+            }
+            catch (Exception originalException)
+            {
+                List<string> rollbackProblems = new List<string>();
+                for (int i = changes.Count - 1; i >= 0; i--)
+                {
+                    NativeSetChange change = changes[i];
+                    try
+                    {
+                        SavedItem currentItem = FindTopLevelSavedItemByName(document, change.Name);
+                        if (change.WasReplacement)
+                        {
+                            if (change.Parent == null || change.Index < 0 || change.Backup == null)
+                                throw new InvalidOperationException("Нет данных резервной копии/позиции.");
+                            // Restoring a replacement does not change the collection size, so the
+                            // original index remains valid after later operations were rolled back.
+                            document.SelectionSets.ReplaceWithCopy(change.Parent, change.Index, change.Backup);
+                        }
+                        else if (currentItem != null && !document.SelectionSets.Remove(currentItem))
+                        {
+                            throw new InvalidOperationException("Remove вернул false.");
+                        }
+                    }
+                    catch (Exception rollbackException)
+                    {
+                        rollbackProblems.Add("'" + change.Name + "': " + rollbackException.Message);
+                    }
+                }
+
+                createdSelectionSetCount = 0;
+                replacedSelectionSetCount = 0;
+                createdTargetModelItemCount = 0;
+                if (rollbackProblems.Count > 0)
+                {
+                    throw new InvalidOperationException(
+                        "Нативная пересборка завершилась ошибкой. При попытке отката возникли проблемы:\n" +
+                        string.Join(Environment.NewLine, rollbackProblems.ToArray()) +
+                        "\nИсходная ошибка: " + originalException.Message,
+                        originalException);
+                }
+
+                throw new InvalidOperationException(
+                    "Нативная пересборка завершилась ошибкой; все изменения этой операции отменены.\n" +
+                    originalException.Message,
+                    originalException);
+            }
         }
 
         private static ExpectedSet CreateWholeRootExpectedSet(
@@ -2331,6 +3042,73 @@ namespace NavisCoordinator.Services
             return current;
         }
 
+        private static bool TryClassifyNativePolicyRepeatedCandidates(
+            ExpectedItem expectedItem,
+            List<List<TargetNodeInfo>> candidatePaths,
+            out string reasonCode)
+        {
+            reasonCode = "NATIVE_POLICY_FANOUT_NOT_SAFE";
+            if (expectedItem == null || candidatePaths == null || candidatePaths.Count < 2)
+            {
+                reasonCode = "NATIVE_POLICY_FANOUT_REQUIRES_MULTIPLE_CANDIDATES";
+                return false;
+            }
+
+            string sourceTerminalType = GetExpectedTerminalNodeType(expectedItem);
+            bool expectedFamily = string.Equals(sourceTerminalType, "Семейство", StringComparison.OrdinalIgnoreCase) ||
+                                  string.Equals(sourceTerminalType, "Family", StringComparison.OrdinalIgnoreCase);
+            bool expectedType = string.Equals(sourceTerminalType, "Тип", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(sourceTerminalType, "Type", StringComparison.OrdinalIgnoreCase);
+            if (!expectedFamily && !expectedType)
+            {
+                reasonCode = "NATIVE_POLICY_FANOUT_ONLY_SUPPORTS_FAMILY_OR_TYPE_NODES";
+                return false;
+            }
+
+            if (!AllCandidatePathsShareTargetRoot(candidatePaths))
+            {
+                reasonCode = "NATIVE_POLICY_CANDIDATES_SPAN_MULTIPLE_LINKED_ROOTS";
+                return false;
+            }
+
+            string repeatReason;
+            if (!AllCandidatePathsRepeatAcrossLevels(candidatePaths, out repeatReason))
+            {
+                reasonCode = "NATIVE_POLICY_" + repeatReason;
+                return false;
+            }
+
+            foreach (List<TargetNodeInfo> candidatePath in candidatePaths)
+            {
+                if (candidatePath == null || candidatePath.Count == 0)
+                {
+                    reasonCode = "NATIVE_POLICY_EMPTY_CANDIDATE_PATH";
+                    return false;
+                }
+
+                TargetNodeInfo terminal = candidatePath[candidatePath.Count - 1];
+                string targetType = GetTargetElementType(terminal);
+                bool targetIsFamily = string.Equals(targetType, "Семейство", StringComparison.OrdinalIgnoreCase) ||
+                                      string.Equals(targetType, "Family", StringComparison.OrdinalIgnoreCase);
+                bool targetIsType = string.Equals(targetType, "Тип", StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(targetType, "Type", StringComparison.OrdinalIgnoreCase);
+
+                if ((expectedFamily && !targetIsFamily) || (expectedType && !targetIsType))
+                {
+                    reasonCode = "NATIVE_POLICY_TARGET_TERMINAL_TYPE_MISMATCH";
+                    return false;
+                }
+            }
+
+            // Unlike legacy transfer, native policy has no source element Id/GUID to compare.
+            // The exact hierarchy path plus a single mapped root and distinct repeated levels
+            // is the intended semantic rule for Family/Type selection in the policy.
+            reasonCode = expectedFamily
+                ? "NATIVE_POLICY_FAMILY_PATH_REPEATS_ON_DISTINCT_LEVELS"
+                : "NATIVE_POLICY_TYPE_PATH_REPEATS_ON_DISTINCT_LEVELS";
+            return true;
+        }
+
         private static bool TryClassifyRepeatedCandidates(
             ExpectedItem expectedItem,
             List<List<TargetNodeInfo>> candidatePaths,
@@ -2825,6 +3603,1161 @@ namespace NavisCoordinator.Services
             }
         }
 
+
+        private static string ReadNativePolicyJson(out string selectedFilePath)
+        {
+            selectedFilePath = null;
+            using (OpenFileDialog dialog = new OpenFileDialog())
+            {
+                dialog.Title = "Выберите UniversalNativeRebuildProfile_v1.json или Native Rebuild policy";
+                dialog.Filter = "Native rebuild policy (*.json)|*.json|All files (*.*)|*.*";
+                dialog.Multiselect = false;
+                dialog.InitialDirectory = Environment.GetFolderPath(
+                    Environment.SpecialFolder.Desktop);
+
+                if (dialog.ShowDialog() != DialogResult.OK)
+                    return null;
+
+                selectedFilePath = dialog.FileName;
+                return File.ReadAllText(dialog.FileName, Encoding.UTF8);
+            }
+        }
+
+        private static List<object> ExpandNativeRuleBasedSets(
+            List<ExpectedSet> expectedSets,
+            Dictionary<string, List<TargetNodeInfo>> indexedRootsByName,
+            string targetDocumentTitle,
+            ref int nodesInspected,
+            out bool searchLimitReached)
+        {
+            const int maxRuleScanNodesPerRoot = 150000;
+            List<object> reports = new List<object>();
+            searchLimitReached = false;
+
+            if (expectedSets == null)
+                return reports;
+
+            foreach (ExpectedSet expectedSet in expectedSets)
+            {
+                if (expectedSet == null ||
+                    !string.Equals(expectedSet.NativeMode, "ruleBased", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                Dictionary<string, object> sectionConfig = expectedSet.NativeRuleConfig;
+                Dictionary<string, object> sectionReport = new Dictionary<string, object>();
+                sectionReport["sectionCode"] = expectedSet.NativeSectionCode;
+                sectionReport["selectionSetName"] = expectedSet.Name;
+                sectionReport["sourceModelFileName"] = expectedSet.NativeSourceModelFileName;
+
+                List<TargetNodeInfo> mappedRoots = null;
+                if (indexedRootsByName == null ||
+                    !indexedRootsByName.TryGetValue(expectedSet.NativeSourceModelFileName, out mappedRoots) ||
+                    mappedRoots == null || mappedRoots.Count != 1 ||
+                    mappedRoots[0] == null || mappedRoots[0].Item == null)
+                {
+                    expectedSet.NativeRuleExpansionStatus = "BLOCKED_ROOT_NOT_UNIQUE";
+                    sectionReport["status"] = expectedSet.NativeRuleExpansionStatus;
+                    sectionReport["reason"] = "A unique target linked-model root is required before target-tree rules can be expanded.";
+                    sectionReport["expectedRootCount"] = mappedRoots == null ? 0 : mappedRoots.Count;
+                    reports.Add(sectionReport);
+                    // Keep the placeholder: the root-mapping report independently blocks transfer.
+                    continue;
+                }
+
+                List<string> categoryAllowList = ReadNativeRuleStringList(sectionConfig, "categoryAllowList");
+                List<string> categoryExcludeList = ReadNativeRuleStringList(sectionConfig, "categoryExcludeList");
+                List<string> requiredCategoryNames = ReadNativeRuleStringList(sectionConfig, "requiredCategoryNames");
+                List<object> rawTypeRules = AsObjectList(GetDictionaryValue(sectionConfig, "includeTypesUnderPaths"));
+                List<object> rawPathRules = AsObjectList(GetDictionaryValue(sectionConfig, "includeExplicitPaths"));
+
+                HashSet<string> excludedCategoryNames = new HashSet<string>(categoryExcludeList, StringComparer.OrdinalIgnoreCase);
+                HashSet<string> expandPathKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                List<Dictionary<string, object>> normalizedTypeRules = new List<Dictionary<string, object>>();
+                List<Dictionary<string, object>> normalizedPathRules = new List<Dictionary<string, object>>();
+                bool invalidRule = false;
+                string invalidRuleMessage = "";
+
+                foreach (object rawRule in rawTypeRules)
+                {
+                    Dictionary<string, object> rule = AsDictionary(rawRule);
+                    if (rule == null)
+                    {
+                        invalidRule = true;
+                        invalidRuleMessage = "includeTypesUnderPaths contains a non-object rule.";
+                        break;
+                    }
+
+                    List<string> path = ReadStringPath(rule, "path");
+                    if (path.Count < 1)
+                    {
+                        invalidRule = true;
+                        invalidRuleMessage = "Each includeTypesUnderPaths rule needs a non-empty path.";
+                        break;
+                    }
+
+                    rule["__normalizedPath"] = path;
+                    normalizedTypeRules.Add(rule);
+                    for (int count = 1; count <= path.Count; count++)
+                        expandPathKeys.Add(NativePolicyPathKey(path.GetRange(0, count)));
+                }
+
+                if (!invalidRule)
+                {
+                    foreach (object rawRule in rawPathRules)
+                    {
+                        Dictionary<string, object> rule = AsDictionary(rawRule);
+                        if (rule == null)
+                        {
+                            invalidRule = true;
+                            invalidRuleMessage = "includeExplicitPaths contains a non-object rule.";
+                            break;
+                        }
+
+                        List<string> path = ReadStringPath(rule, "path");
+                        string nodeType = NativePolicyNodeTypeToRussian(GetDictionaryString(rule, "nodeType"));
+                        if (path.Count < 1 ||
+                            (nodeType != "Семейство" && nodeType != "Тип" && nodeType != "Категория"))
+                        {
+                            invalidRule = true;
+                            invalidRuleMessage = "Each includeExplicitPaths rule needs a path and nodeType Category, Family, or Type.";
+                            break;
+                        }
+
+                        rule["__normalizedPath"] = path;
+                        rule["__normalizedNodeType"] = nodeType;
+                        normalizedPathRules.Add(rule);
+                        // The terminal path node does not need to be expanded; all prefixes before it do.
+                        for (int count = 1; count < path.Count; count++)
+                            expandPathKeys.Add(NativePolicyPathKey(path.GetRange(0, count)));
+                    }
+                }
+
+                if (invalidRule)
+                {
+                    expectedSet.NativeRuleExpansionStatus = "BLOCKED_INVALID_RULE";
+                    sectionReport["status"] = expectedSet.NativeRuleExpansionStatus;
+                    sectionReport["reason"] = invalidRuleMessage;
+                    reports.Add(sectionReport);
+                    // Create a missing synthetic path so the regular preflight cannot treat this as ready.
+                    expectedSet.Items.Clear();
+                    expectedSet.Items.Add(CreateNativePolicyExpectedItem(
+                        targetDocumentTitle,
+                        expectedSet.NativeSourceModelFileName,
+                        new List<string> { "__INVALID_NATIVE_RULE_CONFIG__" },
+                        "Тип"));
+                    continue;
+                }
+
+                Dictionary<string, List<NativeObservedNode>> observedByPath;
+                HashSet<string> observedCategoryNames;
+                int scannedNodes;
+                bool truncated;
+                try
+                {
+                    ScanNativePolicyTree(
+                        mappedRoots[0].Item,
+                        expandPathKeys,
+                        maxRuleScanNodesPerRoot,
+                        ref nodesInspected,
+                        out observedByPath,
+                        out observedCategoryNames,
+                        out scannedNodes,
+                        out truncated);
+                }
+                catch (SearchLimitException)
+                {
+                    searchLimitReached = true;
+                    expectedSet.NativeRuleExpansionStatus = "SEARCH_LIMIT_REACHED";
+                    sectionReport["status"] = expectedSet.NativeRuleExpansionStatus;
+                    sectionReport["reason"] = "Global node-inspection safety limit reached during rule expansion.";
+                    reports.Add(sectionReport);
+                    break;
+                }
+
+                List<ExpectedItem> expandedItems = new List<ExpectedItem>();
+                HashSet<string> addedExpectedPathKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                List<string> categoriesIncluded = new List<string>();
+                List<string> categoriesNotFound = new List<string>();
+                List<string> requiredCategoriesNotFound = new List<string>();
+                List<object> typeRuleReports = new List<object>();
+                List<object> explicitPathReports = new List<object>();
+
+                // Category allow-list is deliberate: categories absent on a particular stage are
+                // reported, while newly observed/unlisted categories are never auto-included.
+                foreach (string categoryName in categoryAllowList)
+                {
+                    if (excludedCategoryNames.Contains(categoryName))
+                        continue;
+
+                    bool found = observedCategoryNames.Contains(categoryName);
+                    if (found)
+                    {
+                        List<string> path = new List<string> { categoryName };
+                        if (AddNativeExpectedPath(
+                            expandedItems,
+                            addedExpectedPathKeys,
+                            targetDocumentTitle,
+                            expectedSet.NativeSourceModelFileName,
+                            path,
+                            "Категория"))
+                        {
+                            categoriesIncluded.Add(categoryName);
+                        }
+                    }
+                    else
+                    {
+                        categoriesNotFound.Add(categoryName);
+                    }
+                }
+
+                // Required category signatures protect the OV1/OV2 swap and the critical VK rule.
+                // If such a category is absent, add an intentionally-unresolvable sentinel path so
+                // ordinary preflight reports a MISSING node and blocks any transfer.
+                foreach (string requiredCategory in requiredCategoryNames)
+                {
+                    if (observedCategoryNames.Contains(requiredCategory))
+                        continue;
+
+                    requiredCategoriesNotFound.Add(requiredCategory);
+                    AddNativeExpectedPath(
+                        expandedItems,
+                        addedExpectedPathKeys,
+                        targetDocumentTitle,
+                        expectedSet.NativeSourceModelFileName,
+                        new List<string> { requiredCategory },
+                        "Категория");
+                }
+
+                foreach (Dictionary<string, object> rule in normalizedTypeRules)
+                {
+                    List<string> parentPath = (List<string>)rule["__normalizedPath"];
+                    List<string> excludedTypes = ReadNativeRuleStringList(rule, "excludeNames");
+                    HashSet<string> excludedTypeSet = new HashSet<string>(excludedTypes, StringComparer.OrdinalIgnoreCase);
+                    HashSet<string> includedTypeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    List<string> excludedTypeNamesFound = new List<string>();
+                    string ruleName = GetDictionaryString(rule, "name");
+
+                    foreach (KeyValuePair<string, List<NativeObservedNode>> observedPair in observedByPath)
+                    {
+                        foreach (NativeObservedNode observed in observedPair.Value)
+                        {
+                            if (observed == null || observed.Path == null ||
+                                observed.Path.Count != parentPath.Count + 1 ||
+                                !NativePathStartsWith(observed.Path, parentPath) ||
+                                !IsNativePolicyTerminalType(observed.ElementType, "Тип"))
+                                continue;
+
+                            string typeName = observed.Path[observed.Path.Count - 1];
+                            if (excludedTypeSet.Contains(typeName))
+                            {
+                                if (!ContainsIgnoreCase(excludedTypeNamesFound, typeName))
+                                    excludedTypeNamesFound.Add(typeName);
+                                continue;
+                            }
+
+                            if (includedTypeNames.Add(typeName))
+                            {
+                                AddNativeExpectedPath(
+                                    expandedItems,
+                                    addedExpectedPathKeys,
+                                    targetDocumentTitle,
+                                    expectedSet.NativeSourceModelFileName,
+                                    observed.Path,
+                                    "Тип");
+                            }
+                        }
+                    }
+
+                    Dictionary<string, object> typeReport = new Dictionary<string, object>();
+                    typeReport["name"] = ruleName;
+                    typeReport["parentPath"] = parentPath;
+                    typeReport["includedUniqueTypeCount"] = includedTypeNames.Count;
+                    typeReport["includedTypeNames"] = new List<string>(includedTypeNames);
+                    typeReport["excludedTypeNamesFound"] = excludedTypeNamesFound;
+                    typeReport["required"] = GetDictionaryBoolean(rule, "required", false);
+                    if (includedTypeNames.Count == 0 && GetDictionaryBoolean(rule, "required", false))
+                    {
+                        typeReport["status"] = "REQUIRED_TYPE_RULE_NO_MATCH";
+                        List<string> sentinelPath = new List<string>(parentPath);
+                        sentinelPath.Add("__REQUIRED_NATIVE_TYPE_RULE_NOT_FOUND__");
+                        AddNativeExpectedPath(
+                            expandedItems,
+                            addedExpectedPathKeys,
+                            targetDocumentTitle,
+                            expectedSet.NativeSourceModelFileName,
+                            sentinelPath,
+                            "Тип");
+                    }
+                    else
+                    {
+                        typeReport["status"] = includedTypeNames.Count == 0 ? "OPTIONAL_TYPE_RULE_NO_MATCH" : "MATCHED";
+                    }
+                    typeRuleReports.Add(typeReport);
+                }
+
+                foreach (Dictionary<string, object> rule in normalizedPathRules)
+                {
+                    List<string> expectedPath = (List<string>)rule["__normalizedPath"];
+                    string expectedType = (string)rule["__normalizedNodeType"];
+                    bool required = GetDictionaryBoolean(rule, "required", false);
+                    bool found = false;
+                    foreach (KeyValuePair<string, List<NativeObservedNode>> observedPair in observedByPath)
+                    {
+                        foreach (NativeObservedNode observed in observedPair.Value)
+                        {
+                            if (observed != null && NativePathEquals(observed.Path, expectedPath) &&
+                                IsNativePolicyTerminalType(observed.ElementType, expectedType))
+                            {
+                                found = true;
+                                AddNativeExpectedPath(
+                                    expandedItems,
+                                    addedExpectedPathKeys,
+                                    targetDocumentTitle,
+                                    expectedSet.NativeSourceModelFileName,
+                                    expectedPath,
+                                    expectedType);
+                                break;
+                            }
+                        }
+                        if (found) break;
+                    }
+
+                    Dictionary<string, object> pathReport = new Dictionary<string, object>();
+                    pathReport["path"] = expectedPath;
+                    pathReport["nodeType"] = expectedType;
+                    pathReport["required"] = required;
+                    pathReport["status"] = found ? "MATCHED" : (required ? "REQUIRED_PATH_NOT_FOUND" : "OPTIONAL_PATH_NOT_FOUND");
+                    explicitPathReports.Add(pathReport);
+                    if (!found && required)
+                    {
+                        AddNativeExpectedPath(
+                            expandedItems,
+                            addedExpectedPathKeys,
+                            targetDocumentTitle,
+                            expectedSet.NativeSourceModelFileName,
+                            expectedPath,
+                            expectedType);
+                    }
+                }
+
+                expectedSet.Items.Clear();
+                expectedSet.Items.AddRange(expandedItems);
+                expectedSet.NativeRuleExpansionItemCount = expandedItems.Count;
+                expectedSet.NativeRuleExpansionStatus = truncated ? "SEARCH_TRUNCATED" :
+                    (requiredCategoriesNotFound.Count > 0 ? "REQUIRED_CATEGORY_NOT_FOUND" : "EXPANDED");
+
+                sectionReport["status"] = expectedSet.NativeRuleExpansionStatus;
+                sectionReport["nodesScanned"] = scannedNodes;
+                sectionReport["treeScanTruncated"] = truncated;
+                sectionReport["includedCategoryNames"] = categoriesIncluded;
+                sectionReport["configuredCategoryNamesNotFound"] = categoriesNotFound;
+                sectionReport["requiredCategoryNamesNotFound"] = requiredCategoriesNotFound;
+                sectionReport["dynamicTypeRules"] = typeRuleReports;
+                sectionReport["explicitPathRules"] = explicitPathReports;
+                sectionReport["expandedExpectedItemCount"] = expandedItems.Count;
+                sectionReport["observedCategoryNameCount"] = observedCategoryNames.Count;
+                sectionReport["autoIncludedUnlistedCategories"] = false;
+                reports.Add(sectionReport);
+
+                if (truncated)
+                {
+                    searchLimitReached = true;
+                    break;
+                }
+            }
+
+            return reports;
+        }
+
+        private static void ScanNativePolicyTree(
+            ModelItem linkedRoot,
+            HashSet<string> expandPathKeys,
+            int maxNodesToScan,
+            ref int nodesInspected,
+            out Dictionary<string, List<NativeObservedNode>> observedByPath,
+            out HashSet<string> observedCategoryNames,
+            out int scannedNodes,
+            out bool truncated)
+        {
+            observedByPath = new Dictionary<string, List<NativeObservedNode>>(StringComparer.OrdinalIgnoreCase);
+            observedCategoryNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            scannedNodes = 0;
+            truncated = false;
+            if (linkedRoot == null)
+                return;
+
+            Queue<NativeRuleWalkNode> queue = new Queue<NativeRuleWalkNode>();
+            NativeRuleWalkNode root = new NativeRuleWalkNode();
+            root.Item = linkedRoot;
+            root.Path = new List<string>();
+            root.Depth = 0;
+            queue.Enqueue(root);
+
+            while (queue.Count > 0)
+            {
+                NativeRuleWalkNode current = queue.Dequeue();
+                if (current == null || current.Item == null)
+                    continue;
+
+                if (current.Depth >= 12)
+                    continue;
+
+                IEnumerable<ModelItem> children;
+                try
+                {
+                    children = current.Item.Children;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (ModelItem child in children)
+                {
+                    if (child == null)
+                        continue;
+                    scannedNodes++;
+                    if (scannedNodes > maxNodesToScan)
+                    {
+                        truncated = true;
+                        return;
+                    }
+                    CountInspectedNode(ref nodesInspected);
+
+                    string className = SafeModelItemClassName(child);
+                    bool isLayer = string.Equals(className, "LcRevitLayer", StringComparison.OrdinalIgnoreCase);
+                    List<string> nodePath = isLayer
+                        ? new List<string>(current.Path)
+                        : AppendNativePathSegment(current.Path, SafeDisplayName(child));
+                    if (!isLayer && nodePath.Count > 0)
+                    {
+                        string elementType = GetModelItemPropertyValue(child, "Элемент", "Тип");
+                        NativeObservedNode observed = new NativeObservedNode();
+                        observed.Item = child;
+                        observed.Path = nodePath;
+                        observed.DisplayName = SafeDisplayName(child);
+                        observed.ElementType = elementType ?? "";
+                        string pathKey = NativePolicyPathKey(nodePath);
+                        List<NativeObservedNode> samePathNodes;
+                        if (!observedByPath.TryGetValue(pathKey, out samePathNodes))
+                        {
+                            samePathNodes = new List<NativeObservedNode>();
+                            observedByPath.Add(pathKey, samePathNodes);
+                        }
+                        samePathNodes.Add(observed);
+
+                        if (nodePath.Count == 1 && IsCategoryType(observed.ElementType))
+                            observedCategoryNames.Add(observed.DisplayName);
+                    }
+
+                    bool shouldExpand = isLayer;
+                    if (!isLayer)
+                    {
+                        string elementType = GetModelItemPropertyValue(child, "Элемент", "Тип");
+                        shouldExpand = IsCategoryType(elementType) || expandPathKeys.Contains(NativePolicyPathKey(nodePath));
+                    }
+
+                    if (shouldExpand)
+                    {
+                        NativeRuleWalkNode next = new NativeRuleWalkNode();
+                        next.Item = child;
+                        next.Path = nodePath;
+                        next.Depth = current.Depth + 1;
+                        queue.Enqueue(next);
+                    }
+                }
+            }
+        }
+
+        private static bool AddNativeExpectedPath(
+            List<ExpectedItem> items,
+            HashSet<string> addedPathKeys,
+            string documentRootName,
+            string sourceModelFileName,
+            List<string> path,
+            string terminalNodeType)
+        {
+            if (items == null || addedPathKeys == null || path == null || path.Count == 0)
+                return false;
+
+            string key = NativePolicyPathKey(path) + "|" + (terminalNodeType ?? "");
+            if (!addedPathKeys.Add(key))
+                return false;
+
+            ExpectedItem item = CreateNativePolicyExpectedItem(
+                documentRootName,
+                sourceModelFileName,
+                new List<string>(path),
+                terminalNodeType);
+            item.DisplayName = path[path.Count - 1];
+            items.Add(item);
+            return true;
+        }
+
+        private static bool ContainsIgnoreCase(List<string> values, string value)
+        {
+            if (values == null) return false;
+            foreach (string item in values)
+                if (string.Equals(item, value, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+
+        private static List<string> ReadNativeRuleStringList(Dictionary<string, object> dictionary, string key)
+        {
+            List<string> result = new List<string>();
+            foreach (object raw in AsObjectList(GetDictionaryValue(dictionary, key)))
+            {
+                string value = raw == null ? "" : Convert.ToString(raw, CultureInfo.InvariantCulture);
+                if (!string.IsNullOrWhiteSpace(value) &&
+                    !ContainsIgnoreCase(result, value))
+                    result.Add(value);
+            }
+            return result;
+        }
+
+        private static List<string> ReadStringPath(Dictionary<string, object> dictionary, string key)
+        {
+            List<string> result = new List<string>();
+            foreach (object raw in AsObjectList(GetDictionaryValue(dictionary, key)))
+            {
+                string segment = raw == null ? "" : Convert.ToString(raw, CultureInfo.InvariantCulture);
+                if (string.IsNullOrWhiteSpace(segment))
+                    return new List<string>();
+                result.Add(segment);
+            }
+            return result;
+        }
+
+        private static bool GetDictionaryBoolean(Dictionary<string, object> dictionary, string key, bool defaultValue)
+        {
+            object value = GetDictionaryValue(dictionary, key);
+            if (value == null) return defaultValue;
+            if (value is bool) return (bool)value;
+            bool parsed;
+            return bool.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out parsed) ? parsed : defaultValue;
+        }
+
+        private static string NativePolicyPathKey(List<string> path)
+        {
+            return string.Join("\u001f", path ?? new List<string>());
+        }
+
+        private static List<string> AppendNativePathSegment(List<string> currentPath, string segment)
+        {
+            List<string> result = currentPath == null ? new List<string>() : new List<string>(currentPath);
+            if (!string.IsNullOrWhiteSpace(segment))
+                result.Add(segment);
+            return result;
+        }
+
+        private static bool NativePathEquals(List<string> left, List<string> right)
+        {
+            if (left == null || right == null || left.Count != right.Count)
+                return false;
+            for (int index = 0; index < left.Count; index++)
+                if (!string.Equals(left[index], right[index], StringComparison.OrdinalIgnoreCase))
+                    return false;
+            return true;
+        }
+
+        private static bool NativePathStartsWith(List<string> path, List<string> prefix)
+        {
+            if (path == null || prefix == null || path.Count < prefix.Count)
+                return false;
+            for (int index = 0; index < prefix.Count; index++)
+                if (!string.Equals(path[index], prefix[index], StringComparison.OrdinalIgnoreCase))
+                    return false;
+            return true;
+        }
+
+        private static bool IsNativePolicyTerminalType(string actualType, string expectedType)
+        {
+            string actual = NativePolicyNodeTypeToRussian(actualType);
+            if (string.IsNullOrWhiteSpace(actual)) actual = actualType ?? "";
+            string expected = NativePolicyNodeTypeToRussian(expectedType);
+            if (string.IsNullOrWhiteSpace(expected)) expected = expectedType ?? "";
+            return string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Universal mode expands section profiles against linked RVT roots in the active NWF.
+        // Project prefix is derived from the NWF filename; the stage token and root count are not fixed.
+        private static List<ExpectedSet> ReadUniversalNativeRebuildPolicyExpectedSets(
+            Dictionary<string, object> profileDocument,
+            Document document,
+            string targetDocumentTitle)
+        {
+            Dictionary<string, object> targetConfig =
+                AsDictionary(GetDictionaryValue(profileDocument, "target"));
+            if (targetConfig == null ||
+                !GetDictionaryBoolean(targetConfig, "autoDiscoverLinkedRoots", false))
+            {
+                throw new InvalidDataException(
+                    "Выбранный профиль не включает autoDiscoverLinkedRoots=true.");
+            }
+
+            List<object> rawProfiles = AsObjectList(GetDictionaryValue(profileDocument, "sectionProfiles"));
+            if (rawProfiles.Count == 0)
+                throw new InvalidDataException("В универсальном профиле отсутствует массив sectionProfiles.");
+
+            Dictionary<string, Dictionary<string, object>> profilesByCode =
+                new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+            foreach (object rawProfile in rawProfiles)
+            {
+                Dictionary<string, object> profile = AsDictionary(rawProfile);
+                if (profile == null)
+                    throw new InvalidDataException("Каждый элемент sectionProfiles должен быть JSON-объектом.");
+
+                string profileCode = GetDictionaryString(profile, "sectionCode");
+                if (string.IsNullOrWhiteSpace(profileCode))
+                    throw new InvalidDataException("У профиля раздела отсутствует sectionCode.");
+                if (profilesByCode.ContainsKey(profileCode))
+                    throw new InvalidDataException("В sectionProfiles повторяется sectionCode: " + profileCode);
+
+                profilesByCode.Add(profileCode, profile);
+            }
+
+            Dictionary<string, object> configuredNames =
+                AsDictionary(GetDictionaryValue(profileDocument, "setNamesBySection"));
+            if (configuredNames == null)
+                configuredNames = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
+            string projectPrefix = ExtractProjectPrefixBeforeRdMarker(targetDocumentTitle);
+            if (string.IsNullOrWhiteSpace(projectPrefix))
+            {
+                throw new InvalidDataException(
+                    "Не удалось определить префикс проекта в имени NWF. Ожидается имя с маркером _РД_, " +
+                    "например Project_РД_ПРК_СБ.nwf. Файл не изменён.");
+            }
+
+            int nodesInspected = 0;
+            List<ModelItem> targetRoots = FindAllLinkedModelRoots(document, ref nodesInspected);
+            List<object> dynamicSections = new List<object>();
+            Dictionary<string, object> dynamicSetNames =
+                new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> detectedSectionCodes =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<string> matchingRootNames = new List<string>();
+            List<string> unsupportedRootNames = new List<string>();
+
+            foreach (ModelItem root in targetRoots)
+            {
+                string displayName = SafeDisplayName(root);
+                string fileName = ExtractModelFileName(displayName);
+                if (string.IsNullOrWhiteSpace(fileName))
+                    continue;
+
+                string rootProjectPrefix = ExtractProjectPrefixBeforeRdMarker(fileName);
+                if (!string.Equals(projectPrefix, rootProjectPrefix, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string sectionCode = ExtractUniversalSectionCode(
+                    fileName, profilesByCode.Keys);
+                if (string.IsNullOrWhiteSpace(sectionCode))
+                {
+                    unsupportedRootNames.Add(displayName + " [не удалось определить код раздела]");
+                    continue;
+                }
+
+                Dictionary<string, object> sectionProfile;
+                if (!profilesByCode.TryGetValue(sectionCode, out sectionProfile))
+                {
+                    unsupportedRootNames.Add(displayName + " [профиль не настроен: " + sectionCode + "]");
+                    continue;
+                }
+
+                if (!detectedSectionCodes.Add(sectionCode))
+                {
+                    throw new InvalidDataException(
+                        "Найдено несколько связанных RVT одного раздела '" + sectionCode +
+                        "'. Автоматически объединять их в один Selection Set небезопасно. Корень: " + displayName);
+                }
+
+                Dictionary<string, object> runtimeSection =
+                    new Dictionary<string, object>(sectionProfile, StringComparer.OrdinalIgnoreCase);
+                string selectionSetName = GetDictionaryString(configuredNames, sectionCode);
+                if (string.IsNullOrWhiteSpace(selectionSetName))
+                    selectionSetName = GetDictionaryString(sectionProfile, "selectionSetName");
+                if (string.IsNullOrWhiteSpace(selectionSetName))
+                    selectionSetName = TransliterateSectionCodeToSetName(sectionCode);
+                if (string.IsNullOrWhiteSpace(selectionSetName))
+                {
+                    throw new InvalidDataException(
+                        "Не удалось получить имя Selection Set для раздела '" + sectionCode + "'.");
+                }
+
+                runtimeSection["sectionCode"] = sectionCode;
+                runtimeSection["selectionSetName"] = selectionSetName;
+                runtimeSection["sourceModelFileName"] = fileName;
+                runtimeSection["expectedTargetModelFileName"] = fileName;
+                dynamicSections.Add(runtimeSection);
+                dynamicSetNames[sectionCode] = selectionSetName;
+                matchingRootNames.Add(sectionCode + " -> " + fileName + " -> " + selectionSetName);
+            }
+
+            if (dynamicSections.Count == 0)
+            {
+                throw new InvalidDataException(
+                    "В текущем NWF не найдено ни одного корня проекта '" + projectPrefix +
+                    "', для которого настроен профиль. Проверь _РД_ в имени RVT и список sectionProfiles.");
+            }
+
+            Dictionary<string, object> runtimePolicy =
+                new Dictionary<string, object>(profileDocument, StringComparer.OrdinalIgnoreCase);
+            runtimePolicy["sections"] = dynamicSections;
+            runtimePolicy["setNamesBySection"] = dynamicSetNames;
+            runtimePolicy["universalNativeRebuild"] = true;
+            runtimePolicy["universalProjectPrefix"] = projectPrefix;
+            runtimePolicy["universalDetectedRoots"] = matchingRootNames;
+            runtimePolicy["universalUnsupportedRootsAtExpansion"] = unsupportedRootNames;
+
+            Dictionary<string, object> runtimeTarget =
+                new Dictionary<string, object>(targetConfig, StringComparer.OrdinalIgnoreCase);
+            runtimeTarget["autoDiscoverLinkedRoots"] = true;
+            runtimeTarget["expectedLinkedRootCount"] = 0;
+            runtimePolicy["target"] = runtimeTarget;
+
+            // The main report and unmapped-root preflight use these runtime flags.
+            profileDocument["universalNativeRebuild"] = true;
+            profileDocument["universalProjectPrefix"] = projectPrefix;
+            profileDocument["universalDetectedRoots"] = matchingRootNames;
+            profileDocument["universalUnsupportedRootsAtExpansion"] = unsupportedRootNames;
+
+            return ReadNativeRebuildPolicyExpectedSets(runtimePolicy, targetDocumentTitle);
+        }
+
+        private static string ExtractProjectPrefixBeforeRdMarker(string fileOrDisplayName)
+        {
+            if (string.IsNullOrWhiteSpace(fileOrDisplayName))
+                return "";
+
+            string fileName = Path.GetFileName(fileOrDisplayName.Trim());
+            if (string.IsNullOrWhiteSpace(fileName))
+                fileName = fileOrDisplayName.Trim();
+
+            int markerIndex = fileName.IndexOf("_РД_", StringComparison.OrdinalIgnoreCase);
+            if (markerIndex <= 0)
+                return "";
+
+            return fileName.Substring(0, markerIndex).Trim();
+        }
+
+        private static string ExtractUniversalSectionCode(
+            string modelFileName,
+            IEnumerable<string> configuredSectionCodes)
+        {
+            string fileName = ExtractModelFileName(modelFileName);
+            if (string.IsNullOrWhiteSpace(fileName))
+                return "";
+
+            int markerIndex = fileName.IndexOf("_РД_", StringComparison.OrdinalIgnoreCase);
+            if (markerIndex < 0)
+                return "";
+
+            // The discipline code is a complete underscore-delimited token somewhere
+            // after _РД_. This supports both ..._РД_ОВ1_ПРК_... and ..._РД_ПРК_ОВ1_...
+            // without confusing OV1 with OV2 or matching a substring inside another token.
+            string remainder = fileName.Substring(markerIndex + "_РД_".Length);
+            string[] tokens = remainder.Split(new char[] { '_' }, StringSplitOptions.RemoveEmptyEntries);
+            string bestMatch = "";
+            if (configuredSectionCodes != null)
+            {
+                foreach (string candidate in configuredSectionCodes)
+                {
+                    if (string.IsNullOrWhiteSpace(candidate))
+                        continue;
+
+                    foreach (string token in tokens)
+                    {
+                        if (string.Equals(token, candidate, StringComparison.OrdinalIgnoreCase) &&
+                            candidate.Length > bestMatch.Length)
+                        {
+                            bestMatch = candidate;
+                        }
+                    }
+                }
+            }
+
+            return bestMatch;
+        }
+
+        private static List<ExpectedSet> ReadNativeRebuildPolicyExpectedSets(
+            Dictionary<string, object> policyDocument,
+            string targetDocumentTitle)
+        {
+            if (!string.Equals(
+                GetDictionaryString(policyDocument, "documentType"),
+                "NavisCoordinator.NativeRebuildPolicyDraft",
+                StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "Файл не является политикой NavisCoordinator.NativeRebuildPolicyDraft.");
+            }
+
+            int formatVersion;
+            if (!int.TryParse(
+                Convert.ToString(GetDictionaryValue(policyDocument, "formatVersion"), CultureInfo.InvariantCulture),
+                out formatVersion) || formatVersion != 1)
+            {
+                throw new InvalidDataException("Для native rebuild ожидается formatVersion = 1.");
+            }
+
+            Dictionary<string, object> targetConfig =
+                AsDictionary(GetDictionaryValue(policyDocument, "target"));
+            if (targetConfig == null)
+                throw new InvalidDataException("В политике отсутствует объект 'target'.");
+
+            bool autoDiscoverLinkedRoots = GetDictionaryBoolean(
+                targetConfig, "autoDiscoverLinkedRoots", false);
+
+            if (!autoDiscoverLinkedRoots)
+            {
+                string expectedProjectPrefix = GetDictionaryString(targetConfig, "projectPrefix");
+                string expectedStageToken = GetDictionaryString(targetConfig, "stageToken");
+                string actualProjectPrefix;
+                string actualStageToken;
+                if (!TryGetProjectAndStageToken(
+                        targetDocumentTitle,
+                        out actualProjectPrefix,
+                        out actualStageToken))
+                {
+                    throw new InvalidDataException(
+                        "Не удалось определить проект и этап из имени текущего NWF: " + targetDocumentTitle);
+                }
+
+                if (!string.Equals(expectedProjectPrefix, actualProjectPrefix, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(expectedStageToken, actualStageToken, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException(
+                        "Политика предназначена для " + expectedProjectPrefix + " / " + expectedStageToken +
+                        ", а открыт документ " + actualProjectPrefix + " / " + actualStageToken +
+                        ". Выберите корректную копию NWF и соответствующую политику.");
+                }
+            }
+
+            List<object> rawSections = AsObjectList(GetDictionaryValue(policyDocument, "sections"));
+            if (rawSections.Count == 0)
+                throw new InvalidDataException("В политике не найден массив 'sections'.");
+
+            Dictionary<string, object> setNamesBySection =
+                AsDictionary(GetDictionaryValue(policyDocument, "setNamesBySection"));
+            if (setNamesBySection == null)
+                throw new InvalidDataException("В политике отсутствует закреплённая карта setNamesBySection.");
+
+            List<ExpectedSet> result = new List<ExpectedSet>();
+            HashSet<string> seenSetNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> seenSectionCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string syntheticDocumentRootName = string.IsNullOrWhiteSpace(targetDocumentTitle)
+                ? "NATIVE_REBUILD_POLICY"
+                : targetDocumentTitle;
+
+            foreach (object rawSection in rawSections)
+            {
+                Dictionary<string, object> section = AsDictionary(rawSection);
+                if (section == null)
+                    throw new InvalidDataException("Каждый раздел политики должен быть JSON-объектом.");
+
+                string sectionCode = GetDictionaryString(section, "sectionCode");
+                string selectionSetName = GetDictionaryString(section, "selectionSetName");
+                string mode = GetDictionaryString(section, "mode");
+                string sourceModelFileName = ExtractModelFileName(
+                    GetDictionaryString(section, "sourceModelFileName"));
+                string expectedTargetModelFileName = ExtractModelFileName(
+                    GetDictionaryString(section, "expectedTargetModelFileName"));
+
+                if (string.IsNullOrWhiteSpace(sectionCode) ||
+                    string.IsNullOrWhiteSpace(selectionSetName) ||
+                    string.IsNullOrWhiteSpace(sourceModelFileName) ||
+                    string.IsNullOrWhiteSpace(expectedTargetModelFileName))
+                {
+                    throw new InvalidDataException(
+                        "У раздела политики обязательны sectionCode, selectionSetName, sourceModelFileName и expectedTargetModelFileName.");
+                }
+
+                if (!seenSetNames.Add(selectionSetName))
+                    throw new InvalidDataException("Повторяется имя Selection Set в политике: " + selectionSetName);
+                if (!seenSectionCodes.Add(sectionCode))
+                    throw new InvalidDataException("Повторяется sectionCode в политике: " + sectionCode);
+
+                string canonicalName = GetDictionaryString(setNamesBySection, sectionCode);
+                if (string.IsNullOrWhiteSpace(canonicalName) ||
+                    !string.Equals(canonicalName, selectionSetName, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException(
+                        "Имя Selection Set для раздела '" + sectionCode + "' расходится с setNamesBySection. " +
+                        "Ожидалось '" + canonicalName + "', в sections задано '" + selectionSetName + "'.");
+                }
+
+                if (!string.Equals(mode, "wholeLink", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(mode, "explicitNodes", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(mode, "ruleBased", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException(
+                        "Неизвестный mode='" + mode + "' для раздела " + sectionCode + ". " +
+                        "Допустимы wholeLink, explicitNodes, ruleBased.");
+                }
+
+                ExpectedSet expectedSet = new ExpectedSet();
+                expectedSet.Name = selectionSetName;
+                expectedSet.IsNativePolicySet = true;
+                expectedSet.NativeSectionCode = sectionCode;
+                expectedSet.NativeMode = mode;
+                expectedSet.NativeSourceModelFileName = sourceModelFileName;
+                expectedSet.NativeExpectedTargetModelFileName = expectedTargetModelFileName;
+
+                if (string.Equals(mode, "wholeLink", StringComparison.OrdinalIgnoreCase))
+                {
+                    ExpectedItem rootItem = CreateNativePolicyExpectedItem(
+                        syntheticDocumentRootName,
+                        sourceModelFileName,
+                        new List<string>(),
+                        "Ссылка");
+                    expectedSet.Items.Add(rootItem);
+                }
+                else if (string.Equals(mode, "ruleBased", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Keep a temporary root-only item so root mapping can be performed
+                    // before runtime expansion discovers the actual category/type paths.
+                    expectedSet.NativeRuleConfig = section;
+                    ExpectedItem rootPlaceholder = CreateNativePolicyExpectedItem(
+                        syntheticDocumentRootName,
+                        sourceModelFileName,
+                        new List<string>(),
+                        "Ссылка");
+                    expectedSet.Items.Add(rootPlaceholder);
+
+                    List<object> categoryAllowList = AsObjectList(GetDictionaryValue(section, "categoryAllowList"));
+                    List<object> typeRules = AsObjectList(GetDictionaryValue(section, "includeTypesUnderPaths"));
+                    List<object> pathRules = AsObjectList(GetDictionaryValue(section, "includeExplicitPaths"));
+                    if (categoryAllowList.Count == 0 && typeRules.Count == 0 && pathRules.Count == 0)
+                    {
+                        throw new InvalidDataException(
+                            "Раздел " + sectionCode + " с mode=ruleBased должен содержать categoryAllowList, " +
+                            "includeTypesUnderPaths или includeExplicitPaths.");
+                    }
+                }
+                else
+                {
+                    List<object> rawItems = AsObjectList(GetDictionaryValue(section, "items"));
+                    if (rawItems.Count == 0)
+                    {
+                        throw new InvalidDataException(
+                            "Раздел " + sectionCode + " имеет mode=explicitNodes, но не содержит items.");
+                    }
+
+                    foreach (object rawItem in rawItems)
+                    {
+                        Dictionary<string, object> item = AsDictionary(rawItem);
+                        if (item == null)
+                            throw new InvalidDataException("Элемент политики должен быть JSON-объектом.");
+
+                        string itemName = GetDictionaryString(item, "name");
+                        string nodeType = GetDictionaryString(item, "nodeType");
+                        List<object> rawPath = AsObjectList(GetDictionaryValue(item, "path"));
+                        List<string> path = new List<string>();
+                        foreach (object rawSegment in rawPath)
+                        {
+                            string segment = rawSegment == null ? "" : Convert.ToString(rawSegment, CultureInfo.InvariantCulture);
+                            if (string.IsNullOrWhiteSpace(segment))
+                                throw new InvalidDataException(
+                                    "Пустой сегмент path у элемента '" + itemName + "' в разделе " + sectionCode + ".");
+                            path.Add(segment);
+                        }
+
+                        if (string.IsNullOrWhiteSpace(itemName) || path.Count == 0 ||
+                            !string.Equals(path[path.Count - 1], itemName, StringComparison.Ordinal))
+                        {
+                            throw new InvalidDataException(
+                                "У элемента '" + itemName + "' path должен быть непустым и заканчиваться самим элементом.");
+                        }
+
+                        string terminalType = NativePolicyNodeTypeToRussian(nodeType);
+                        if (terminalType != "Категория" && terminalType != "Семейство" && terminalType != "Тип")
+                        {
+                            throw new InvalidDataException(
+                                "nodeType должен быть Category, Family или Type; получено '" + nodeType + "'.");
+                        }
+
+                        if (terminalType == "Category" || terminalType == "Категория")
+                        {
+                            if (path.Count != 1)
+                                throw new InvalidDataException("Для Category ожидается путь из одного сегмента: " + itemName);
+                        }
+                        if (terminalType == "Семейство" && path.Count < 2)
+                            throw new InvalidDataException("Для Family нужен путь через категорию: " + itemName);
+                        if (terminalType == "Тип" && path.Count < 3)
+                            throw new InvalidDataException("Для Type нужен путь категория / семейство / тип: " + itemName);
+
+                        ExpectedItem expectedItem = CreateNativePolicyExpectedItem(
+                            syntheticDocumentRootName,
+                            sourceModelFileName,
+                            path,
+                            terminalType);
+                        expectedItem.DisplayName = itemName;
+                        expectedSet.Items.Add(expectedItem);
+                    }
+                }
+
+                if (expectedSet.Items.Count == 0)
+                    throw new InvalidDataException("У раздела " + sectionCode + " нет ни одного ожидаемого элемента.");
+
+                result.Add(expectedSet);
+            }
+
+            int expectedRootCount = ToInt32(GetDictionaryValue(targetConfig, "expectedLinkedRootCount"));
+            if (expectedRootCount > 0 && result.Count != expectedRootCount)
+            {
+                throw new InvalidDataException(
+                    "Политика содержит разделов: " + result.Count + "; ожидалось: " + expectedRootCount + ".");
+            }
+
+            return result;
+        }
+
+        private static ExpectedItem CreateNativePolicyExpectedItem(
+            string documentRootName,
+            string sourceModelFileName,
+            List<string> path,
+            string terminalNodeType)
+        {
+            ExpectedItem item = new ExpectedItem();
+            item.DisplayName = path != null && path.Count > 0
+                ? path[path.Count - 1]
+                : sourceModelFileName;
+            item.HierarchyNodes = new List<Dictionary<string, object>>();
+            item.HierarchyNodes.Add(CreateSyntheticHierarchyNode(documentRootName, "Файл"));
+            item.HierarchyNodes.Add(CreateSyntheticHierarchyNode(sourceModelFileName, "Ссылка"));
+
+            if (path != null)
+            {
+                for (int index = 0; index < path.Count; index++)
+                {
+                    string nodeType;
+                    if (index == path.Count - 1)
+                    {
+                        nodeType = terminalNodeType;
+                    }
+                    else if (string.Equals(terminalNodeType, "Тип", StringComparison.Ordinal) && index == path.Count - 2)
+                    {
+                        nodeType = "Семейство";
+                    }
+                    else
+                    {
+                        nodeType = "Категория";
+                    }
+
+                    item.HierarchyNodes.Add(CreateSyntheticHierarchyNode(path[index], nodeType));
+                }
+            }
+
+            StringBuilder hierarchyPath = new StringBuilder(documentRootName);
+            hierarchyPath.Append(" / ").Append(sourceModelFileName);
+            if (path != null)
+            {
+                foreach (string segment in path)
+                    hierarchyPath.Append(" / ").Append(segment);
+            }
+            item.SourceHierarchyPath = hierarchyPath.ToString();
+            return item;
+        }
+
+        private static Dictionary<string, object> CreateSyntheticHierarchyNode(
+            string displayName,
+            string elementType)
+        {
+            Dictionary<string, object> property = new Dictionary<string, object>();
+            property["categoryName"] = "LcOaNode";
+            property["categoryDisplayName"] = "Элемент";
+            property["propertyName"] = "LcOaSceneBaseClassUserName";
+            property["propertyDisplayName"] = "Тип";
+            property["value"] = elementType ?? "";
+
+            Dictionary<string, object> node = new Dictionary<string, object>();
+            node["displayName"] = displayName ?? "";
+            node["properties"] = new List<object> { property };
+            return node;
+        }
+
+        private static string NativePolicyNodeTypeToRussian(string nodeType)
+        {
+            if (string.Equals(nodeType, "Category", StringComparison.OrdinalIgnoreCase)) return "Категория";
+            if (string.Equals(nodeType, "Family", StringComparison.OrdinalIgnoreCase)) return "Семейство";
+            if (string.Equals(nodeType, "Type", StringComparison.OrdinalIgnoreCase)) return "Тип";
+            if (string.Equals(nodeType, "WholeLink", StringComparison.OrdinalIgnoreCase)) return "Ссылка";
+            return "";
+        }
+
+        private static string ValidateNativePolicyRootOverrides(
+            Dictionary<string, object> policyDocument,
+            Dictionary<string, string> actualOverrides,
+            bool rootOverridesFileExists)
+        {
+            Dictionary<string, object> rootMapping =
+                AsDictionary(GetDictionaryValue(policyDocument, "rootMapping"));
+            List<object> expectedOverrideItems = rootMapping == null
+                ? new List<object>()
+                : AsObjectList(GetDictionaryValue(rootMapping, "expectedOverrides"));
+
+            if (expectedOverrideItems.Count > 0 && !rootOverridesFileExists)
+            {
+                return "Политика требует rootOverrides.json с правилами переназначения ОВ1↔ОВ2, " +
+                       "но рядом с файлом политики он не найден.";
+            }
+
+            Dictionary<string, string> policyOverrides =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (object raw in expectedOverrideItems)
+            {
+                Dictionary<string, object> entry = AsDictionary(raw);
+                if (entry == null)
+                    return "Некорректная запись expectedOverrides в политике.";
+                string source = ExtractModelFileName(GetDictionaryString(entry, "sourceModelFileName"));
+                string target = ExtractModelFileName(GetDictionaryString(entry, "targetModelFileName"));
+                if (string.IsNullOrWhiteSpace(source) || string.IsNullOrWhiteSpace(target) ||
+                    policyOverrides.ContainsKey(source))
+                    return "В expectedOverrides политики обнаружена пустая или повторная запись.";
+                policyOverrides.Add(source, target);
+            }
+
+            if (policyOverrides.Count != (actualOverrides == null ? 0 : actualOverrides.Count))
+            {
+                return "Количество правил rootOverrides.json не совпадает с политикой. Ожидалось: " +
+                    policyOverrides.Count + "; фактически: " + (actualOverrides == null ? 0 : actualOverrides.Count) + ".";
+            }
+
+            foreach (KeyValuePair<string, string> item in policyOverrides)
+            {
+                string actualTarget;
+                if (actualOverrides == null || !actualOverrides.TryGetValue(item.Key, out actualTarget) ||
+                    !string.Equals(actualTarget, item.Value, StringComparison.OrdinalIgnoreCase))
+                {
+                    return "Правило rootOverrides для '" + item.Key + "' не совпадает с политикой. " +
+                        "Ожидалось: '" + item.Value + "'. Проверьте файл rootOverrides.json.";
+                }
+            }
+
+            List<object> rawSections = AsObjectList(GetDictionaryValue(policyDocument, "sections"));
+            foreach (object rawSection in rawSections)
+            {
+                Dictionary<string, object> section = AsDictionary(rawSection);
+                if (section == null) continue;
+                string source = ExtractModelFileName(GetDictionaryString(section, "sourceModelFileName"));
+                string expectedTarget = ExtractModelFileName(GetDictionaryString(section, "expectedTargetModelFileName"));
+                string actualTarget = source;
+                if (actualOverrides != null && actualOverrides.ContainsKey(source))
+                    actualTarget = actualOverrides[source];
+
+                if (!string.Equals(expectedTarget, actualTarget, StringComparison.OrdinalIgnoreCase))
+                {
+                    return "Ожидаемый целевой корень раздела '" + GetDictionaryString(section, "sectionCode") +
+                        "' расходится с фактическим rootOverrides. Ожидалось '" + expectedTarget +
+                        "', по фактической конфигурации получается '" + actualTarget + "'.";
+                }
+            }
+
+            return "";
+        }
+
         private static List<ExpectedSet> ReadExpectedSets(
             Dictionary<string, object> sourceDocument)
         {
@@ -3122,6 +5055,7 @@ namespace NavisCoordinator.Services
             int oneToManyCategoryCount,
             int oneToManyIdentityCount,
             int oneToManyStructuralCount,
+            int oneToManyNativePolicyCount,
             int identityDisambiguatedCount,
             int missingCount,
             int ambiguousCount,
@@ -3135,6 +5069,7 @@ namespace NavisCoordinator.Services
             bool transferApplied,
             string transferStatus,
             int createdSelectionSetCount,
+            int replacedSelectionSetCount,
             int createdTargetModelItemCount,
             string transferError)
         {
@@ -3152,6 +5087,7 @@ namespace NavisCoordinator.Services
             message.AppendLine("Категорий сопоставлено один-ко-многим: " + oneToManyCategoryCount);
             message.AppendLine("Узлов сопоставлено один-ко-многим по ID/GUID: " + oneToManyIdentityCount);
             message.AppendLine("Контейнеров сопоставлено один-ко-многим по структуре: " + oneToManyStructuralCount);
+            message.AppendLine("Узлов сопоставлено по политике нативного построения: " + oneToManyNativePolicyCount);
             message.AppendLine("Неоднозначность снята выбором одного пути по ID/GUID: " + identityDisambiguatedCount);
             message.AppendLine("Не найдено: " + missingCount);
             message.AppendLine("Неоднозначных соответствий: " + ambiguousCount);
@@ -3171,7 +5107,8 @@ namespace NavisCoordinator.Services
             }
             else if (transferApplied)
             {
-                message.AppendLine("Создано Selection Sets: " + createdSelectionSetCount);
+                message.AppendLine("Создано новых Selection Sets: " + createdSelectionSetCount);
+                message.AppendLine("Заменено существующих Selection Sets: " + replacedSelectionSetCount);
                 message.AppendLine("Всего целевых ModelItem во всех наборах: " + createdTargetModelItemCount);
                 message.AppendLine("Статус переноса: " + transferStatus);
                 message.AppendLine("Документ изменён в памяти. Сохраните рабочую копию NWF вручную, если результат проверен.");
@@ -3311,6 +5248,21 @@ namespace NavisCoordinator.Services
                 builder.Append("  ");
         }
 
+        private sealed class NativeRuleWalkNode
+        {
+            public ModelItem Item;
+            public List<string> Path = new List<string>();
+            public int Depth;
+        }
+
+        private sealed class NativeObservedNode
+        {
+            public ModelItem Item;
+            public List<string> Path = new List<string>();
+            public string DisplayName = "";
+            public string ElementType = "";
+        }
+
         private sealed class TargetNodeInfo
         {
             public ModelItem Item;
@@ -3328,6 +5280,14 @@ namespace NavisCoordinator.Services
             public string Name = "";
             public bool GeneratedFromUnmappedTargetRoot;
             public string GeneratedTargetModelFileName = "";
+            public bool IsNativePolicySet;
+            public string NativeSectionCode = "";
+            public string NativeMode = "";
+            public string NativeSourceModelFileName = "";
+            public string NativeExpectedTargetModelFileName = "";
+            public Dictionary<string, object> NativeRuleConfig;
+            public string NativeRuleExpansionStatus = "NOT_APPLICABLE";
+            public int NativeRuleExpansionItemCount;
             public List<ExpectedItem> Items = new List<ExpectedItem>();
         }
 
