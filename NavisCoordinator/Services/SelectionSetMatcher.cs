@@ -163,7 +163,18 @@ namespace NavisCoordinator.Services
                 Dictionary<string, string> rootOverrides;
                 try
                 {
-                    rootOverrides = LoadRootOverrides(rootOverridesPath, serializer);
+                    if (universalNativeRebuild)
+                    {
+                        // Universal mode always maps by the actual RVT filename discovered
+                        // in the active NWF. Ignore stale project-specific legacy overrides.
+                        rootOverrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        rootOverridesPath = "";
+                        rootOverridesConfigExists = false;
+                    }
+                    else
+                    {
+                        rootOverrides = LoadRootOverrides(rootOverridesPath, serializer);
+                    }
                     if (nativeRebuild)
                     {
                         string nativePolicyMappingError = ValidateNativePolicyRootOverrides(
@@ -302,6 +313,10 @@ namespace NavisCoordinator.Services
                 // policy stable across P1/P2/P3 while allowing level-specific categories and
                 // pipe types to vary naturally between stages.
                 List<object> nativeRuleExpansionReports = new List<object>();
+                List<object> nativeGlobalExclusionReports = new List<object>();
+                Dictionary<string, object> globalExclusionConfig = nativeRebuild
+                    ? AsDictionary(GetDictionaryValue(sourceDocument, "globalExclusions"))
+                    : null;
                 int nativeRuleBasedSetCount = 0;
                 if (nativeRebuild)
                 {
@@ -799,6 +814,32 @@ namespace NavisCoordinator.Services
                         itemReports.Add(itemReport);
                     }
 
+                    Dictionary<string, object> globalExclusionSetReport = null;
+                    if (nativeRebuild)
+                    {
+                        try
+                        {
+                            targetItemsByPath = ApplyNativeGlobalExclusions(
+                                targetItemsByPath,
+                                globalExclusionConfig,
+                                expectedSet.NativeSectionCode,
+                                out globalExclusionSetReport);
+                            globalExclusionSetReport["selectionSetName"] = expectedSet.Name;
+                            nativeGlobalExclusionReports.Add(globalExclusionSetReport);
+                        }
+                        catch (SearchLimitException)
+                        {
+                            searchLimitReached = true;
+                            targetItemsByPath.Clear();
+                            globalExclusionSetReport = new Dictionary<string, object>();
+                            globalExclusionSetReport["sectionCode"] = expectedSet.NativeSectionCode;
+                            globalExclusionSetReport["selectionSetName"] = expectedSet.Name;
+                            globalExclusionSetReport["status"] = "SEARCH_LIMIT_REACHED";
+                            globalExclusionSetReport["reason"] = "Global exclusion traversal reached its separate safety limit of 1,500,000 inspected nodes. Apply is blocked.";
+                            nativeGlobalExclusionReports.Add(globalExclusionSetReport);
+                        }
+                    }
+
                     resolvedTargetItemsBySet[expectedSet] = targetItemsByPath;
 
                     Dictionary<string, object> setReport = new Dictionary<string, object>();
@@ -810,6 +851,7 @@ namespace NavisCoordinator.Services
                     setReport["nativeExpectedTargetModelFileName"] = expectedSet.NativeExpectedTargetModelFileName;
                     setReport["nativeRuleExpansionStatus"] = expectedSet.NativeRuleExpansionStatus;
                     setReport["nativeRuleExpansionItemCount"] = expectedSet.NativeRuleExpansionItemCount;
+                    setReport["globalExclusion"] = globalExclusionSetReport;
                     setReport["generatedFromUnmappedTargetRoot"] = expectedSet.GeneratedFromUnmappedTargetRoot;
                     setReport["generatedTargetModelFileName"] = expectedSet.GeneratedTargetModelFileName;
                     setReport["expectedItemCount"] = expectedSet.Items.Count;
@@ -836,7 +878,7 @@ namespace NavisCoordinator.Services
                 int replacedSelectionSetCount = 0;
                 int createdTargetModelItemCount = 0;
                 Dictionary<string, object> coverageAnalysis = nativeRebuild
-                    ? BuildCoverageAnalysis(expectedSets, indexedRootsByName)
+                    ? BuildCoverageAnalysis(expectedSets, indexedRootsByName, globalExclusionConfig, nativeGlobalExclusionReports)
                     : null;
 
                 Dictionary<string, object> report = new Dictionary<string, object>();
@@ -852,6 +894,9 @@ namespace NavisCoordinator.Services
                     : "";
                 report["coverageAnalysis"] = coverageAnalysis;
                 report["nativeRuleExpansion"] = nativeRebuild ? nativeRuleExpansionReports : null;
+                report["nativeGlobalExclusionReports"] = nativeRebuild ? nativeGlobalExclusionReports : null;
+                report["nativeGlobalExclusionsEnabled"] = nativeRebuild &&
+                    GetDictionaryBoolean(globalExclusionConfig, "enabled", false);
                 report["nativePolicyPath"] = nativeRebuild ? sourceJsonPath : "";
                 report["nativePolicySetCount"] = nativeRebuild ? expectedSets.Count : 0;
                 report["nativePolicyWholeLinkSetCount"] = nativeRebuild
@@ -1934,9 +1979,430 @@ namespace NavisCoordinator.Services
             return count;
         }
 
+        private const int MaxGlobalExclusionPathsInReport = 100;
+        // Whole-link branches may contain substantially more nodes than the matcher needs
+        // for root/path resolution. Keep a separate fail-closed scan budget for exclusions.
+        private const int MaxGlobalExclusionNodesInspected = 1500000;
+
+        private sealed class NativeFilteredSelectionNode
+        {
+            public string Path = "";
+            public ModelItem Item;
+        }
+
+        private sealed class NativeGlobalFilterResult
+        {
+            public bool HasExcludedNode;
+            public List<NativeFilteredSelectionNode> SelectedNodes = new List<NativeFilteredSelectionNode>();
+        }
+
+        private sealed class NativeGlobalFilterStats
+        {
+            public int InspectedNodeCount;
+            public int ExcludedNodeCount;
+            public int SplitBranchCount;
+            public List<string> ExcludedNodeNames = new List<string>();
+            public List<string> ExcludedNodeReasonCodes = new List<string>();
+            public List<string> ExcludedNodePaths = new List<string>();
+            public List<string> SplitCategoryNames = new List<string>();
+        }
+
+        private sealed class NativeGlobalExclusionPolicy
+        {
+            public bool Enabled;
+            public List<string> ExcludedCategoryNames = new List<string>();
+            public List<NativeGlobalCategoryExclusionRule> CategoryRules = new List<NativeGlobalCategoryExclusionRule>();
+            public List<NativeGlobalExactPathExclusionRule> ExactPathRules = new List<NativeGlobalExactPathExclusionRule>();
+            public List<NativeGlobalScopedPathExclusionRule> ScopedPathRules = new List<NativeGlobalScopedPathExclusionRule>();
+        }
+
+        private sealed class NativeGlobalCategoryExclusionRule
+        {
+            public List<string> Names = new List<string>();
+            public List<string> ExcludedSections = new List<string>();
+            public string ReasonCode = "";
+        }
+
+        private sealed class NativeGlobalExactPathExclusionRule
+        {
+            public List<string> Path = new List<string>();
+            public string ReasonCode = "";
+        }
+
+        private sealed class NativeGlobalScopedPathExclusionRule
+        {
+            public List<string> ParentPath = new List<string>();
+            public List<string> Names = new List<string>();
+            public string ReasonCode = "";
+        }
+
+        private static NativeGlobalExclusionPolicy CreateNativeGlobalExclusionPolicy(
+            Dictionary<string, object> config)
+        {
+            if (config == null)
+                return null;
+
+            NativeGlobalExclusionPolicy policy = new NativeGlobalExclusionPolicy();
+            policy.Enabled = GetDictionaryBoolean(config, "enabled", false);
+            policy.ExcludedCategoryNames = ReadNativeRuleStringList(config, "excludedCategoryNames");
+
+            foreach (object rawRule in AsObjectList(GetDictionaryValue(config, "excludedCategoryRules")))
+            {
+                Dictionary<string, object> rule = AsDictionary(rawRule);
+                if (rule == null) continue;
+                NativeGlobalCategoryExclusionRule parsedRule = new NativeGlobalCategoryExclusionRule();
+                parsedRule.Names = ReadNativeRuleStringList(rule, "names");
+                parsedRule.ExcludedSections = ReadNativeRuleStringList(rule, "excludeSections");
+                parsedRule.ReasonCode = GetDictionaryString(rule, "reasonCode");
+                if (parsedRule.Names.Count > 0)
+                    policy.CategoryRules.Add(parsedRule);
+            }
+
+            foreach (object rawRule in AsObjectList(GetDictionaryValue(config, "excludedExactPaths")))
+            {
+                Dictionary<string, object> rule = AsDictionary(rawRule);
+                if (rule == null) continue;
+                NativeGlobalExactPathExclusionRule parsedRule = new NativeGlobalExactPathExclusionRule();
+                parsedRule.Path = ReadStringPath(rule, "path");
+                parsedRule.ReasonCode = GetDictionaryString(rule, "reasonCode");
+                if (parsedRule.Path.Count > 0)
+                    policy.ExactPathRules.Add(parsedRule);
+            }
+
+            foreach (object rawRule in AsObjectList(GetDictionaryValue(config, "excludedNamesUnderPaths")))
+            {
+                Dictionary<string, object> rule = AsDictionary(rawRule);
+                if (rule == null) continue;
+                NativeGlobalScopedPathExclusionRule parsedRule = new NativeGlobalScopedPathExclusionRule();
+                parsedRule.ParentPath = ReadStringPath(rule, "parentPath");
+                parsedRule.Names = ReadNativeRuleStringList(rule, "names");
+                parsedRule.ReasonCode = GetDictionaryString(rule, "reasonCode");
+                if (parsedRule.ParentPath.Count > 0 && parsedRule.Names.Count > 0)
+                    policy.ScopedPathRules.Add(parsedRule);
+            }
+
+            return policy;
+        }
+
+        private static Dictionary<string, ModelItem> ApplyNativeGlobalExclusions(
+            Dictionary<string, ModelItem> sourceItems,
+            Dictionary<string, object> globalExclusionConfig,
+            string sectionCode,
+            out Dictionary<string, object> report)
+        {
+            report = new Dictionary<string, object>();
+            report["sectionCode"] = sectionCode ?? "";
+            report["status"] = "DISABLED";
+            report["sourceSelectionItemCount"] = sourceItems == null ? 0 : sourceItems.Count;
+            NativeGlobalExclusionPolicy exclusionPolicy =
+                CreateNativeGlobalExclusionPolicy(globalExclusionConfig);
+
+            if (exclusionPolicy == null || !exclusionPolicy.Enabled)
+            {
+                report["selectedItemCount"] = sourceItems == null ? 0 : sourceItems.Count;
+                report["excludedNodeCount"] = 0;
+                report["splitBranchCount"] = 0;
+                report["inspectedNodeCount"] = 0;
+                return sourceItems ?? new Dictionary<string, ModelItem>(StringComparer.Ordinal);
+            }
+
+            NativeGlobalFilterStats stats = new NativeGlobalFilterStats();
+            int globalNodesInspected = 0;
+            Dictionary<string, ModelItem> filteredItems =
+                new Dictionary<string, ModelItem>(StringComparer.Ordinal);
+            int sourceItemCount = sourceItems == null ? 0 : sourceItems.Count;
+
+            if (sourceItems != null)
+            {
+                foreach (KeyValuePair<string, ModelItem> pair in sourceItems)
+                {
+                    if (pair.Value == null)
+                        continue;
+
+                    List<string> pathSegments = SplitActualHierarchyPath(pair.Key);
+                    if (pathSegments.Count == 0)
+                        pathSegments.Add(SafeDisplayName(pair.Value));
+
+                    NativeGlobalFilterResult branchResult = FilterNativeSelectionBranch(
+                        pair.Value,
+                        pathSegments,
+                        exclusionPolicy,
+                        sectionCode,
+                        stats,
+                        ref globalNodesInspected,
+                        new HashSet<ModelItem>());
+
+                    foreach (NativeFilteredSelectionNode selectedNode in branchResult.SelectedNodes)
+                    {
+                        if (selectedNode == null || selectedNode.Item == null ||
+                            string.IsNullOrWhiteSpace(selectedNode.Path))
+                            continue;
+
+                        if (!filteredItems.ContainsKey(selectedNode.Path))
+                            filteredItems.Add(selectedNode.Path, selectedNode.Item);
+                    }
+                }
+            }
+
+            report["status"] = "APPLIED";
+            report["sourceSelectionItemCount"] = sourceItemCount;
+            report["selectedItemCount"] = filteredItems.Count;
+            report["excludedNodeCount"] = stats.ExcludedNodeCount;
+            report["splitBranchCount"] = stats.SplitBranchCount;
+            report["inspectedNodeCount"] = stats.InspectedNodeCount;
+            report["maxInspectedNodeCount"] = MaxGlobalExclusionNodesInspected;
+            report["excludedNodeNamesFound"] = stats.ExcludedNodeNames;
+            report["excludedNodeReasonCodes"] = stats.ExcludedNodeReasonCodes;
+            report["excludedNodePaths"] = stats.ExcludedNodePaths;
+            report["splitCategoryNames"] = stats.SplitCategoryNames;
+            report["appliesToWholeLinkAndRuleBasedSets"] = true;
+            return filteredItems;
+        }
+
+        private static NativeGlobalFilterResult FilterNativeSelectionBranch(
+            ModelItem item,
+            List<string> pathSegments,
+            NativeGlobalExclusionPolicy exclusionPolicy,
+            string sectionCode,
+            NativeGlobalFilterStats stats,
+            ref int globalNodesInspected,
+            HashSet<ModelItem> recursionStack)
+        {
+            NativeGlobalFilterResult result = new NativeGlobalFilterResult();
+            if (item == null)
+                return result;
+
+            if (recursionStack.Contains(item))
+            {
+                result.SelectedNodes.Add(new NativeFilteredSelectionNode
+                {
+                    Item = item,
+                    Path = JoinActualHierarchyPath(pathSegments)
+                });
+                return result;
+            }
+
+            globalNodesInspected++;
+            if (globalNodesInspected > MaxGlobalExclusionNodesInspected)
+                throw new SearchLimitException();
+            stats.InspectedNodeCount++;
+
+            string displayName = SafeDisplayName(item);
+            string exclusionReason;
+            if (IsNativeGlobalExcludedNode(
+                displayName,
+                pathSegments,
+                exclusionPolicy,
+                sectionCode,
+                out exclusionReason))
+            {
+                stats.ExcludedNodeCount++;
+                if (!ContainsIgnoreCase(stats.ExcludedNodeNames, displayName) &&
+                    stats.ExcludedNodeNames.Count < MaxGlobalExclusionPathsInReport)
+                    stats.ExcludedNodeNames.Add(displayName);
+                if (!ContainsIgnoreCase(stats.ExcludedNodeReasonCodes, exclusionReason) &&
+                    stats.ExcludedNodeReasonCodes.Count < MaxGlobalExclusionPathsInReport)
+                    stats.ExcludedNodeReasonCodes.Add(exclusionReason);
+
+                string excludedPath = JoinActualHierarchyPath(pathSegments);
+                if (stats.ExcludedNodePaths.Count < MaxGlobalExclusionPathsInReport &&
+                    !stats.ExcludedNodePaths.Contains(excludedPath))
+                    stats.ExcludedNodePaths.Add(excludedPath);
+
+                result.HasExcludedNode = true;
+                return result;
+            }
+
+            if (!IsNativeGlobalExclusionContainer(item))
+            {
+                result.SelectedNodes.Add(new NativeFilteredSelectionNode
+                {
+                    Item = item,
+                    Path = JoinActualHierarchyPath(pathSegments)
+                });
+                return result;
+            }
+
+            recursionStack.Add(item);
+            List<NativeFilteredSelectionNode> childSelections = new List<NativeFilteredSelectionNode>();
+            bool childHasExcludedNode = false;
+
+            foreach (ModelItem child in item.Children)
+            {
+                if (child == null)
+                    continue;
+
+                List<string> childPath = new List<string>(pathSegments);
+                string childName = SafeDisplayName(child);
+                if (!string.IsNullOrWhiteSpace(childName))
+                    childPath.Add(childName);
+
+                NativeGlobalFilterResult childResult = FilterNativeSelectionBranch(
+                    child,
+                    childPath,
+                    exclusionPolicy,
+                    sectionCode,
+                    stats,
+                    ref globalNodesInspected,
+                    recursionStack);
+
+                if (childResult.HasExcludedNode)
+                    childHasExcludedNode = true;
+
+                childSelections.AddRange(childResult.SelectedNodes);
+            }
+
+            recursionStack.Remove(item);
+
+            if (!childHasExcludedNode)
+            {
+                result.SelectedNodes.Add(new NativeFilteredSelectionNode
+                {
+                    Item = item,
+                    Path = JoinActualHierarchyPath(pathSegments)
+                });
+                return result;
+            }
+
+            result.HasExcludedNode = true;
+            result.SelectedNodes.AddRange(childSelections);
+            stats.SplitBranchCount++;
+
+            string elementType = GetModelItemPropertyValue(item, "Элемент", "Тип");
+            if (IsCategoryType(elementType) && !string.IsNullOrWhiteSpace(displayName) &&
+                !ContainsIgnoreCase(stats.SplitCategoryNames, displayName))
+                stats.SplitCategoryNames.Add(displayName);
+
+            return result;
+        }
+
+        private static bool IsNativeGlobalExclusionContainer(ModelItem item)
+        {
+            if (item == null)
+                return false;
+
+            string className = SafeModelItemClassName(item);
+            return string.Equals(className, "LcRevitLink", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(className, "LcRevitLayer", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(className, "LcRevitCollection", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(className, "LcRevitInstance", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(className, "LcRevitComposite", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsNativeGlobalExcludedNode(
+            string nodeName,
+            List<string> actualPath,
+            NativeGlobalExclusionPolicy exclusionPolicy,
+            string sectionCode,
+            out string reason)
+        {
+            reason = "";
+            if (string.IsNullOrWhiteSpace(nodeName) || exclusionPolicy == null || !exclusionPolicy.Enabled)
+                return false;
+
+            if (ContainsIgnoreCase(exclusionPolicy.ExcludedCategoryNames, nodeName))
+            {
+                reason = "GLOBAL_EXCLUDED_CATEGORY";
+                return true;
+            }
+
+            foreach (NativeGlobalCategoryExclusionRule categoryRule in exclusionPolicy.CategoryRules)
+            {
+                if (ContainsIgnoreCase(categoryRule.Names, nodeName) &&
+                    !ContainsIgnoreCase(categoryRule.ExcludedSections, sectionCode))
+                {
+                    reason = string.IsNullOrWhiteSpace(categoryRule.ReasonCode)
+                        ? "GLOBAL_EXCLUDED_SCOPED_CATEGORY"
+                        : categoryRule.ReasonCode;
+                    return true;
+                }
+            }
+
+            foreach (NativeGlobalExactPathExclusionRule exactRule in exclusionPolicy.ExactPathRules)
+            {
+                if (NativePathContainsSequence(actualPath, exactRule.Path) &&
+                    string.Equals(
+                        exactRule.Path[exactRule.Path.Count - 1],
+                        nodeName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    reason = string.IsNullOrWhiteSpace(exactRule.ReasonCode)
+                        ? "GLOBAL_EXCLUDED_EXACT_PATH"
+                        : exactRule.ReasonCode;
+                    return true;
+                }
+            }
+
+            foreach (NativeGlobalScopedPathExclusionRule scopedRule in exclusionPolicy.ScopedPathRules)
+            {
+                if (ContainsIgnoreCase(scopedRule.Names, nodeName) &&
+                    NativePathContainsSequence(actualPath, scopedRule.ParentPath))
+                {
+                    reason = string.IsNullOrWhiteSpace(scopedRule.ReasonCode)
+                        ? "GLOBAL_EXCLUDED_SCOPED_PATH"
+                        : scopedRule.ReasonCode;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool NativePathContainsSequence(List<string> actualPath, List<string> requiredPath)
+        {
+            if (actualPath == null || requiredPath == null || requiredPath.Count == 0 ||
+                actualPath.Count < requiredPath.Count)
+                return false;
+
+            for (int start = 0; start <= actualPath.Count - requiredPath.Count; start++)
+            {
+                bool matches = true;
+                for (int index = 0; index < requiredPath.Count; index++)
+                {
+                    if (!string.Equals(
+                        actualPath[start + index] ?? "",
+                        requiredPath[index] ?? "",
+                        StringComparison.OrdinalIgnoreCase))
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static List<string> SplitActualHierarchyPath(string path)
+        {
+            List<string> result = new List<string>();
+            if (string.IsNullOrWhiteSpace(path))
+                return result;
+
+            string[] segments = path.Split(new string[] { " / " }, StringSplitOptions.None);
+            foreach (string segment in segments)
+            {
+                string value = (segment ?? "").Trim();
+                if (!string.IsNullOrWhiteSpace(value))
+                    result.Add(value);
+            }
+            return result;
+        }
+
+        private static string JoinActualHierarchyPath(List<string> pathSegments)
+        {
+            if (pathSegments == null || pathSegments.Count == 0)
+                return "";
+            return string.Join(" / ", pathSegments.ToArray());
+        }
+
         private static Dictionary<string, object> BuildCoverageAnalysis(
             List<ExpectedSet> expectedSets,
-            Dictionary<string, List<TargetNodeInfo>> indexedRootsByName)
+            Dictionary<string, List<TargetNodeInfo>> indexedRootsByName,
+            Dictionary<string, object> globalExclusionConfig,
+            List<object> globalExclusionReports)
         {
             const int maxInspectedNodesPerRoot = 150000;
             Dictionary<string, object> coverage = new Dictionary<string, object>();
@@ -1960,6 +2426,21 @@ namespace NavisCoordinator.Services
             int totalObservedCategoryNames = 0;
             int totalUnclassifiedCategoryNames = 0;
             int incompleteRootScans = 0;
+            NativeGlobalExclusionPolicy exclusionPolicy =
+                CreateNativeGlobalExclusionPolicy(globalExclusionConfig);
+            Dictionary<string, Dictionary<string, object>> exclusionReportBySetName =
+                new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+            if (globalExclusionReports != null)
+            {
+                foreach (object rawExclusionReport in globalExclusionReports)
+                {
+                    Dictionary<string, object> exclusionReport = AsDictionary(rawExclusionReport);
+                    if (exclusionReport == null) continue;
+                    string setName = GetDictionaryString(exclusionReport, "selectionSetName");
+                    if (!string.IsNullOrWhiteSpace(setName))
+                        exclusionReportBySetName[setName] = exclusionReport;
+                }
+            }
 
             foreach (KeyValuePair<string, ExpectedSet> sectionPair in bySection)
             {
@@ -2055,6 +2536,18 @@ namespace NavisCoordinator.Services
                     }
                 }
 
+                List<string> splitCategoryNames = new List<string>();
+                Dictionary<string, object> matchingExclusionReport;
+                if (exclusionReportBySetName.TryGetValue(set.Name, out matchingExclusionReport))
+                {
+                    foreach (object rawName in AsObjectList(GetDictionaryValue(matchingExclusionReport, "splitCategoryNames")))
+                    {
+                        string splitName = rawName == null ? "" : Convert.ToString(rawName, CultureInfo.InvariantCulture);
+                        if (!string.IsNullOrWhiteSpace(splitName) && !ContainsIgnoreCase(splitCategoryNames, splitName))
+                            splitCategoryNames.Add(splitName);
+                    }
+                }
+
                 List<string> observedNames = new List<string>(observedCategoryCounts.Keys);
                 observedNames.Sort(StringComparer.OrdinalIgnoreCase);
                 List<object> categoryReports = new List<object>();
@@ -2066,9 +2559,26 @@ namespace NavisCoordinator.Services
                     bool selectedDescendant = selectedDescendantCategories.Contains(categoryName);
                     string classification;
                     string status;
-                    if (wholeLink)
+                    string categoryExclusionReason;
+                    bool globallyExcludedCategory = IsNativeGlobalExcludedNode(
+                        categoryName,
+                        new List<string> { categoryName },
+                        exclusionPolicy,
+                        set.NativeSectionCode,
+                        out categoryExclusionReason);
+                    if (globallyExcludedCategory)
                     {
-                        classification = "coveredByWholeLink";
+                        classification = "explicitlyExcludedByGlobalRule";
+                        status = "explicitlyNotSelected_byGlobalRule";
+                    }
+                    else if (ContainsIgnoreCase(splitCategoryNames, categoryName))
+                    {
+                        classification = "partiallyCoveredByGlobalExclusions";
+                        status = "includedByPolicy_partially";
+                    }
+                    else if (wholeLink)
+                    {
+                        classification = "coveredByWholeLinkAfterGlobalExclusions";
                         status = "includedByPolicy";
                     }
                     else if (selectedWhole)
@@ -2121,7 +2631,20 @@ namespace NavisCoordinator.Services
                 sectionReport["observedCategoryCount"] = observedCategoryCounts.Count;
                 sectionReport["unclassifiedCategoryCount"] = sectionUnclassified;
                 sectionReport["categories"] = categoryReports;
-                sectionReport["wholeLinkCoversAllObservedCategories"] = string.Equals(set.NativeMode, "wholeLink", StringComparison.OrdinalIgnoreCase);
+                bool globalExclusionsEnabled = exclusionPolicy != null && exclusionPolicy.Enabled;
+                bool globalExclusionCompleted = !globalExclusionsEnabled ||
+                    (matchingExclusionReport != null &&
+                     string.Equals(
+                         GetDictionaryString(matchingExclusionReport, "status"),
+                         "APPLIED",
+                         StringComparison.OrdinalIgnoreCase));
+                bool noGlobalExclusionsFound = !globalExclusionsEnabled ||
+                    (matchingExclusionReport != null &&
+                     ToInt32(GetDictionaryValue(matchingExclusionReport, "excludedNodeCount")) == 0);
+                sectionReport["wholeLinkCoversAllObservedCategories"] =
+                    string.Equals(set.NativeMode, "wholeLink", StringComparison.OrdinalIgnoreCase) &&
+                    globalExclusionCompleted && noGlobalExclusionsFound;
+                sectionReport["globalExclusionSplitCategoryNames"] = splitCategoryNames;
                 sectionReports.Add(sectionReport);
                 totalObservedCategoryNames += observedCategoryCounts.Count;
                 totalUnclassifiedCategoryNames += sectionUnclassified;
